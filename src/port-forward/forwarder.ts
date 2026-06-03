@@ -16,7 +16,7 @@ export function createForwarder(
     changeOrigin: true,
     ws: true,
     secure: true,
-    agent: getProxyAgent(),
+    agent: getProxyAgent(refresher.proxyUrl),
   });
 
   proxy.on('error', (err: Error, _req: unknown, resOrSocket: http.ServerResponse | net.Socket) => {

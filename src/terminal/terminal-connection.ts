@@ -120,7 +120,7 @@ export class TerminalConnection {
     log.debug('Connecting to Colab terminal:', wsUrl);
 
     return new Promise<void>((resolve, reject) => {
-      const agent = getProxyAgent();
+      const agent = getProxyAgent(wsUrl);
       this.ws = new WebSocket(wsUrl, {
         headers: {
           [COLAB_RUNTIME_PROXY_TOKEN_HEADER.key]: this.getToken(),

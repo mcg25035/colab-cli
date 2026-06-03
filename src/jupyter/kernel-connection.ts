@@ -345,7 +345,7 @@ export class KernelConnection {
     log.debug('Connecting WebSocket to:', wsEndpoint);
 
     return new Promise<void>((resolve, reject) => {
-      const agent = getProxyAgent();
+      const agent = getProxyAgent(wsEndpoint);
       this.ws = new WebSocket(wsEndpoint, {
         headers: {
           [COLAB_RUNTIME_PROXY_TOKEN_HEADER.key]: token,

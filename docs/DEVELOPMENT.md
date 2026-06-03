@@ -968,7 +968,7 @@ https://7860-<endpoint>.<domain>.colab.dev    (Google 边缘代理)
 - **CORS 响应头重写**：上游 `Access-Control-Allow-Origin` 会回显 Colab 代理域名，浏览器 CORS 检查会因 origin 不匹配而拒绝 fetch/XHR 响应。通过 `proxyRes` 事件将 `Access-Control-Allow-Origin` 重写为本地监听的 `http://localhost:PORT` 或 `https://localhost:PORT`
 - 每个请求通过 `headers` 选项注入最新 token 和 `X-Colab-Client-Agent`
 - 错误处理：HTTP 请求返回 502，WebSocket 连接直接 destroy socket
-- 支持 `HTTPS_PROXY` 环境变量（通过 `getProxyAgent()`）
+- 支持 `HTTPS_PROXY` / `NO_PROXY` 环境变量（通过 `getProxyAgent(targetUrl)`）。`getProxyAgent` 接收目标 URL（`ws`/`wss` 先归一化为 `http`/`https`），交由 `proxy-from-env` 的 `getProxyForUrl` 判定是否走代理——标准 NO_PROXY 语义（逗号/空格分隔、前导点后缀匹配、`*` 通配、`host:port` 匹配、大小写无关）。这样可直连的数据面（如 `*.prod.colab.dev`）能绕过仅为控制面（Google API）配置的本地代理：设 `NO_PROXY=.prod.colab.dev` 即直连建隧道，少叠一跳延迟
 
 **已知局限（localhost 代理固有问题）**：
 
@@ -1216,7 +1216,7 @@ colab-vscode 使用的 Zod 版本允许直接传 TS enum 对象给 `z.enum()`。
 ./dist/index.js --verbose exec "print(1)"
 ```
 
-`dist/index.js` 的 shebang 已内置 `node --use-env-proxy --disable-warning=UNDICI-EHPA`，因此直接执行可自动启用基于环境变量的代理支持。若显式使用 `node dist/index.js ...`，则不会经过 shebang，需要自行补上 `--use-env-proxy`。
+`dist/index.js` 的 shebang 已内置 `node --use-env-proxy --disable-warning=UNDICI-EHPA`，因此直接执行可自动启用基于环境变量的代理支持。`--use-env-proxy` 让原生 `fetch`（undici，承载控制面 Google API/auth/Drive）按标准约定读取 `HTTP(S)_PROXY` / `NO_PROXY`；数据面（`ws` / `http-proxy`）不经过 undici，其代理由 `getProxyAgent()` 单独处理（见上）。若显式使用 `node dist/index.js ...`，则不会经过 shebang，需要自行补上 `--use-env-proxy`。
 
 `--verbose` 会输出 `[debug]` 和 `[trace]` 级别日志，包括：
 - 守护进程启动/连接事件
