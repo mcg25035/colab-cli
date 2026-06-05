@@ -1197,7 +1197,7 @@ colab-vscode 使用的 Zod 版本允许直接传 TS enum 对象给 `z.enum()`。
 - [x] 图片输出：守护进程内由 `image-saver.ts` 立即持久化到 `~/.config/colab-cli/outputs/<serverId>/`，`--output-dir` 可指定目录（CLI 端解析为绝对路径后传递给守护进程）；CLI 端 `terminal-renderer` 仅打印 savedPaths 路径
 - [x] stdin 透传 + Ctrl+C 中断：拦截 `input_request` → readline/raw mode 获取用户输入 → `input_reply`；Ctrl+C → `interrupt` → kernel 中断 → 渲染 traceback
 - [x] 守护进程内 WebSocket 自动重连（Kernel + Terminal 均已实现，指数退避 + ping 保活）
-- [x] `--json` 输出模式（结构化输出）— 全局 `--json` flag，非 exec 命令通过 `createSpinner()` + `jsonResult()` 支持；登录命令（auth login / drive login / drive-mount login）在 `--json` 模式下非阻塞：输出 `auth_required` 事件（含 URL 和超时）后立即退出，后台守护进程等待 OAuth 回调完成凭证存储。`exec` 不支持 `--json`（打印警告并忽略），因为 exec 依赖交互式终端进行流式输出、stdin 透传和 Ctrl+C 中断
+- [x] `--json` 输出模式（结构化输出）— 全局 `--json` flag，非 exec/shell 命令通过 `createSpinner()` + `jsonResult()` 支持；登录命令（auth login / drive login / drive-mount login）在 `--json` 模式下非阻塞：输出 `auth_required` 事件（含 URL 和超时）后立即退出，后台守护进程等待 OAuth 回调完成凭证存储。`exec` 和 `shell` 不支持 `--json`（exec 打印警告并忽略），因为它们依赖交互式终端进行流式输出、stdin 透传和 Ctrl+C 中断
 - [x] `colab drive-mount`：自动 Drive 挂载（伪 GCE metadata server + DriveFS，一次授权后免浏览器）
 - [x] `runtime versions`：查看可用 runtime 版本及环境详情（Python、PyTorch 等），`runtime create --version` 指定版本
 - [x] Ctrl+C 中断 kernel 执行：exec 期间 Ctrl+C → `client.interrupt()` → daemon → `POST /api/kernels/<id>/interrupt` → kernel 发回 KeyboardInterrupt traceback → CLI 渲染后正常退出；第二次 Ctrl+C force exit
@@ -1330,7 +1330,7 @@ npm run dev          # watch 模式编译
 
 ### 命令总览
 
-除 `exec` 外的所有命令支持全局 `--json` 标志，输出结构化 JSON Lines 到 stdout（适用于脚本自动化）。常规情况下最后一行是带 `command` 字段的结果对象。登录命令（auth login / drive login / drive-mount login）在 `--json` 模式下非阻塞：输出 `{"event":"auth_required","authType":"...","url":"...","timeoutSeconds":120}` 后立即退出，后台守护进程等待 OAuth 回调；调用方可通过对应的 `status --json` 命令轮询确认登录完成。命令级失败通常输出 `{"error":"..."}` 并以非零状态退出。`exec` 忽略 `--json`（打印警告），因为它依赖交互式终端进行流式输出、stdin 透传和 Ctrl+C 中断。
+除 `exec` 和 `shell` 外的所有命令支持全局 `--json` 标志，输出结构化 JSON Lines 到 stdout（适用于脚本自动化）。常规情况下最后一行是带 `command` 字段的结果对象。登录命令（auth login / drive login / drive-mount login）在 `--json` 模式下非阻塞：输出 `{"event":"auth_required","authType":"...","url":"...","timeoutSeconds":120}` 后立即退出，后台守护进程等待 OAuth 回调；调用方可通过对应的 `status --json` 命令轮询确认登录完成。命令级失败通常输出 `{"error":"..."}` 并以非零状态退出。`exec` 和 `shell` 忽略 `--json`，因为它们依赖交互式终端进行流式输出和 stdin 透传。
 
 ```text
 auth login
