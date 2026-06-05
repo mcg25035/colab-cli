@@ -51,7 +51,7 @@ When reproducing a project, running an unvalidated script, or otherwise executin
 
 ## JSON Output (`--json`)
 
-Most commands accept a global `--json` flag (`exec` excluded). When set, spinners are suppressed and the result is written as a single JSON object to stdout. Use this for scripting and automation.
+Most commands accept a global `--json` flag (`exec` and `shell` excluded). When set, spinners are suppressed and the result is written as a single JSON object to stdout. Use this for scripting and automation.
 
 ```bash
 # Extract a folder ID reliably
@@ -256,6 +256,7 @@ colab drive-mount status                 # Check authorization status
 - Requires `COLAB_DRIVEFS_CLIENT_ID` and `COLAB_DRIVEFS_CLIENT_SECRET` environment variables.
 - One-time `login` saves a persistent refresh token. After that, `drive-mount` works without browser interaction on any new runtime.
 - Drive is mounted at `/content/drive`. Python code calling `drive.mount('/content/drive')` will detect the existing mount and return immediately.
+- Drive mount is lost after `colab runtime restart`; re-run `colab drive-mount` to restore it.
 - When the env vars are not set, this command group is hidden and the standard browser-based auth flow is used as fallback.
 
 ### Choosing `fs` vs `drive`
