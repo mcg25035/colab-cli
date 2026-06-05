@@ -10,10 +10,10 @@
 
 | 项 | 值 |
 |---|---|
-| 基准 commit | `38d41a5` fix: only attempt to recover from auth errors once (#493) |
-| 基准日期 | 2026-03-17 |
-| 审查日期 | 2026-04-20 |
-| 上游 HEAD | `8319ccc` refactor: increase OAuth sign-in screen wait timeout (#565) |
+| 基准 commit | `8319ccc` refactor: increase OAuth sign-in screen wait timeout (#565) |
+| 基准日期 | 2026-04-20 |
+| 审查日期 | 2026-06-05 |
+| 上游 HEAD | `6394d51` build(deps-dev): bump qs from 6.14.2 to 6.15.2 (#602) |
 
 ---
 
@@ -50,6 +50,19 @@
 | `c24df57` / `f7bb8eb` / `3c0ddb5` / `1a2db3a` / `a5822a4` | ResourceTreeProvider 系列 | VS Code tree view |
 | `8319ccc` refactor: OAuth timeout (#565) | e2e 测试超时 | 测试 |
 | build/CI/deps/chore commits | 版本号、依赖升级、lint 配置等 | 无功能影响 |
+| `e2227d0` fix: preserve Request headers in colabProxyFetch (#558) | 代理 fetch 保留调用方 header、proxy header 优先 | colab-cli 用 openapi middleware（`AddProxyToken`）已经 `.set()` 覆盖并保留原 header；该修复针对 node-fetch 的 `Request` 兼容，CLI 不涉及 |
+| `312c085` fix: tolerate orphan assignment deletion races in getServers (#587) | 枚举外部 server 时对 listSessions 404 容错 | VS Code tree view 专用：CLI 的 `list()` 只调 `listAssignments()`，不逐个 `listSessions` 补 label |
+| `d8c80db` fix: concurrent getChildren empty list (#588) | 并发 getChildren 返回空列表修复 | VS Code tree view 专用 |
+| `50d6f31` refactor: split extension.ts into per-feature modules (#572) | activation 拆模块 | VS Code extension 专用 |
+| `52c6395` feat: enrich assign_server_event (#577) | assign 流程加 outcome/configuration telemetry | VS Code telemetry；assign 错误处理逻辑本身未变，CLI 无 telemetry |
+| `2a674b3` feat: telemetry for low/depleted CCU balance (#578) | CCU 余额通知 telemetry | VS Code telemetry |
+| `e27c447` feat: telemetry for downloads (#576) | 下载 telemetry | VS Code telemetry |
+| `26543dd` feat: telemetry for content browser file ops (#575) | 文件操作 telemetry | VS Code telemetry |
+| `d0dbe15` feat: telemetry for opening terminal (#574) | 终端 telemetry | VS Code telemetry |
+| `9717c1b` feat: telemetry for uploads (#573) | 上传 telemetry | VS Code telemetry |
+| `a8bbf5e` feat: telemetry for notebook imports (#567) | notebook 导入 telemetry | VS Code telemetry |
+| `e2280f9` / `efb8498` / `f07bfe8` / `e3dfe4d` test 系列 (#599/#581/#586/#583) | e2e/单测稳定性 | 测试 |
+| `d5c7a9c` chore: upgrade actions node24 (#580) | CI runner 升级 | CI |
 
 ---
 
