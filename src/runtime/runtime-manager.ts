@@ -8,7 +8,7 @@ import {
   shapeToMachineShape,
   isHighMemOnlyAccelerator,
 } from '../colab/api.js';
-import { ColabClient } from '../colab/client.js';
+import { ColabClient, ColabRequestError } from '../colab/client.js';
 import { log } from '../logging/index.js';
 import { startDaemon, stopDaemon } from '../daemon/lifecycle.js';
 import {
@@ -107,12 +107,19 @@ export class RuntimeManager {
     const servers = listStoredServers();
     const server = servers.find((s) => s.endpoint === endpoint);
 
+    try {
+      await this.colabClient.unassign(endpoint);
+    } catch (err) {
+      if (!(err instanceof ColabRequestError && err.status === 404)) {
+        throw err;
+      }
+      log.debug('Runtime already unassigned by backend:', endpoint);
+    }
+
     if (server) {
       await stopDaemon(server.id);
       removeStoredServer(server.id);
     }
-
-    await this.colabClient.unassign(endpoint);
   }
 
   async list(): Promise<ListedAssignment[]> {
