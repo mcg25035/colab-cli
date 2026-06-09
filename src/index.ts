@@ -65,6 +65,7 @@ program
   .name('colab')
   .description('interact with Google Colab GPU runtimes from the terminal')
   .version('0.1.0')
+  .allowExcessArguments(false)
   .option('--verbose', 'enable verbose logging')
   .option('--json', 'output results as JSON to stdout (for scripting)')
   .configureHelp({
