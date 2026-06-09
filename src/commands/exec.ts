@@ -315,7 +315,7 @@ export async function execSendCommand(
   await client.connect(server.id);
 
   try {
-    client.execSend(execId, {
+    await client.execSend(execId, {
       stdin: options.stdin,
       interrupt: options.interrupt,
     });

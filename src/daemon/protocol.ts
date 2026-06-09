@@ -51,6 +51,7 @@ export type ServerMessage =
       pendingAuth?: { authType: AuthType; authUrl?: string };
     }
   | { type: 'exec_list_result'; executions: ExecListEntry[] }
+  | { type: 'exec_send_ack'; execId: number }
   | { type: 'exec_clear_result'; count: number }
   | { type: 'shell_opened'; shellId: number }
   | { type: 'shell_output'; shellId: number; data: string }

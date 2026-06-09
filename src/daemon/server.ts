@@ -659,16 +659,31 @@ function handleClient(
           return;
         }
         if (msg.interrupt) {
-          kernel.interrupt().catch(() => {});
+          try {
+            await kernel.interrupt();
+          } catch (err) {
+            send({
+              type: 'exec_error',
+              message: `Interrupt failed: ${err instanceof Error ? err.message : String(err)}`,
+            });
+            return;
+          }
           if (active.pendingStdinResolve) {
             active.pendingStdinResolve(undefined);
             active.pendingStdinResolve = undefined;
           }
+          send({ type: 'exec_send_ack', execId: msg.execId });
         } else if (msg.stdin !== undefined) {
-          if (active.pendingStdinResolve) {
-            active.pendingStdinResolve(msg.stdin);
-            active.pendingStdinResolve = undefined;
+          if (!active.pendingStdinResolve) {
+            send({
+              type: 'exec_error',
+              message: `Execution ${msg.execId} is not waiting for input`,
+            });
+            return;
           }
+          active.pendingStdinResolve(msg.stdin);
+          active.pendingStdinResolve = undefined;
+          send({ type: 'exec_send_ack', execId: msg.execId });
         }
         break;
       }
@@ -696,7 +711,9 @@ function handleClient(
         break;
       }
       case 'interrupt':
-        kernel.interrupt().catch(() => {});
+        kernel.interrupt().catch((err) => {
+          console.error('Interrupt failed:', err instanceof Error ? err.message : err);
+        });
         if (execState.activeExecution?.pendingStdinResolve) {
           execState.activeExecution.pendingStdinResolve(undefined);
           execState.activeExecution.pendingStdinResolve = undefined;

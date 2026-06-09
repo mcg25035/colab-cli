@@ -136,13 +136,31 @@ export class DaemonClient {
     throw new Error(`Unexpected response: ${msg.type}`);
   }
 
-  execSend(execId: number, opts: { stdin?: string; interrupt?: boolean }): void {
+  async execSend(execId: number, opts: { stdin?: string; interrupt?: boolean }): Promise<void> {
     this.send({
       type: 'exec_send',
       execId,
       ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
       ...(opts.interrupt ? { interrupt: true } : {}),
     });
+    // Daemons started by older builds never ack exec_send — bound the wait so
+    // the CLI fails loudly instead of hanging forever against one.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), 10_000);
+    });
+    try {
+      const msg = await Promise.race([this.nextMessage(), timeout]);
+      if (msg === 'timeout') {
+        throw new Error(
+          'Timed out waiting for daemon reply after 10s. The daemon may be busy or running an older build without exec send acks.',
+        );
+      }
+      if (msg.type === 'exec_error') throw new Error(msg.message);
+      if (msg.type !== 'exec_send_ack') throw new Error(`Unexpected response: ${msg.type}`);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async execClear(execId?: number): Promise<number> {
