@@ -159,6 +159,7 @@ colab exec clear 1
 - Use `exec clear` to remove all completed executions, or `exec clear <id>` to remove a specific one. Running and input-waiting executions are preserved.
 - If `input()` is called during background execution with no client attached, execution waits until stdin is delivered via `exec send <id> --stdin` or a client attaches.
 - `--interrupt` only delivers SIGINT to the kernel. Children spawned with `start_new_session=True` / `nohup` / `setsid` or daemon-ized survive and `colab exec` cannot reach them — clean up via `colab shell`.
+- Output from background threads (`print`, `sys.stderr.write`) is captured normally. If `logging` output is missing, it was filtered, not lost: Colab kernels pre-install a root logging handler, so `logging.basicConfig(level=...)` is a no-op and the root logger stays at WARNING. Use `logging.basicConfig(level=..., force=True)` (or `logging.getLogger().setLevel(...)`) to see INFO/DEBUG records.
 
 ### Interactive Shell Sessions
 
