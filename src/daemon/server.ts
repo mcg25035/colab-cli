@@ -551,9 +551,12 @@ function handleClient(
     switch (msg.type) {
       case 'exec': {
         if (execState.activeExecution) {
+          const busyId = execState.activeExecution.execId;
           send({
             type: 'exec_error',
-            message: 'Daemon is already executing code for another session',
+            message:
+              `Daemon is already executing code for another session (exec ${busyId}). ` +
+              `Interrupt it with \`colab exec send ${busyId} --interrupt\` or wait for it to finish.`,
           });
           return;
         }
