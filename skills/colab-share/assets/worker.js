@@ -6,7 +6,9 @@
 // deterministic *.prod.colab.dev upstream. Because everything runs at the CF
 // edge and the credential lives in the Worker, forwarding keeps working even
 // when the machine that deployed it is asleep or offline — until the Colab
-// instance is released (after which the upstream mint fails and we 502).
+// instance is released (after which the proxy-token mint fails and we serve a
+// 503 "Runtime no longer available" page; a 502 means nothing is listening on
+// the port yet).
 //
 // Bindings (set by the deploy script):
 //   vars:    ENDPOINT, PORT, CLIENT_ID, CLIENT_SECRET
@@ -91,6 +93,36 @@ function unavailablePage(env, kind, detail) {
   });
 }
 
+// Optional keep-alive. While KEEPALIVE_UNTIL (an ISO-8601 instant) is in the
+// future, a cron trigger (see wrangler.toml [triggers]) periodically pings the
+// runtime's keep-alive endpoint so Colab does not idle-recycle it even when the
+// machine that deployed this Worker is offline. Past the deadline — or if the var
+// is unset — this is a no-op, letting the runtime be reclaimed when idle so it
+// stops burning Colab quota. It reuses the very same credential chain as the
+// proxy (refresh_token → access_token), so it needs NO extra bindings; and
+// because nothing here writes back the refresh_token, it cannot disturb the
+// local colab-cli login state.
+async function sendKeepAlive(env) {
+  const until = Date.parse(env.KEEPALIVE_UNTIL || '');
+  if (!until || Date.now() > until) return; // deadline passed or unset -> stop
+  const access = await getAccess(env);
+  const u = `https://colab.research.google.com/tun/m/${env.ENDPOINT}/keep-alive/?authuser=0`;
+  // This endpoint intentionally holds the connection open and never returns a
+  // body promptly — the keep-alive *signal is the request reaching Colab*, not
+  // the response (colab-cli's own daemon fires it and discards the result). So
+  // we only need the request to be sent: abort after a short wait instead of
+  // leaving a forever-pending fetch hanging on the scheduled handler's waitUntil.
+  await fetch(u, {
+    signal: AbortSignal.timeout(15000),
+    headers: {
+      Authorization: 'Bearer ' + access,
+      'X-Colab-Tunnel': 'Google',
+      'X-Colab-Client-Agent': 'vscode',
+      Accept: 'application/json',
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     let proxy;
@@ -142,5 +174,12 @@ export default {
     const acao = respHeaders.get('access-control-allow-origin');
     if (acao && acao.includes(origin)) respHeaders.set('access-control-allow-origin', reqUrl.origin);
     return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: respHeaders });
+  },
+
+  // Cron-driven keep-alive (a no-op once KEEPALIVE_UNTIL passes). Errors are
+  // swallowed: a failed ping (e.g. the runtime was already released) must not
+  // throw out of the scheduled handler.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sendKeepAlive(env).catch(() => {}));
   },
 };

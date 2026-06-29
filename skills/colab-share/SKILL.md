@@ -43,6 +43,18 @@ url, so the url need not be known ahead of time).
 that Worker is dead weight (it shows the unavailable page); delete it, and create
 a fresh one for any new instance/port.
 
+**Edge-side keep-alive (on by default).** Proxying credentials does not stop
+Colab from *idle-recycling* the runtime once the local colab-cli daemon stops
+heartbeating (e.g. the laptop sleeps). So the Worker also carries a cron trigger
+(`*/5 * * * *`) whose `scheduled` handler pings the runtime's keep-alive endpoint
+— at the edge, independent of the local machine. It runs only until the
+`KEEPALIVE_UNTIL` deadline (default **8h** from publish), then becomes a no-op so
+an unused runtime is reclaimed instead of silently burning Colab quota. The ping
+reuses the same `refresh_token → access_token` chain as the proxy, so it needs
+**no extra bindings**, and since nothing writes the refresh_token back, it cannot
+invalidate the local colab-cli login. Tune with `COLAB_WF_KEEPALIVE_HOURS`
+(`0` = effectively disabled; deadline lands in the past).
+
 ## Prerequisites — check these first
 
 1. **A Cloudflare account (free plan works), with wrangler logged in.** Verify
@@ -82,9 +94,10 @@ scripts/colab-wf.sh publish <port> <endpoint>
 
 This deterministically: creates a project under
 `~/.config/colab-cli/worker-forward/<port>-<endpoint>-<timestamp>/`, writes
-`wrangler.toml` (vars: `ENDPOINT`, `PORT`, `CLIENT_ID`, `CLIENT_SECRET`),
-`wrangler deploy`s a Worker named `<port>-<endpoint>`, uploads the
-`REFRESH_TOKEN` secret (read from `auth.json`), and prints the public URL:
+`wrangler.toml` (vars: `ENDPOINT`, `PORT`, `CLIENT_ID`, `CLIENT_SECRET`,
+`KEEPALIVE_UNTIL`; plus a `[triggers]` cron), `wrangler deploy`s a Worker named
+`<port>-<endpoint>`, uploads the `REFRESH_TOKEN` secret (read from `auth.json`),
+and prints the public URL:
 
 ```
 https://<port>-<endpoint>.<account-subdomain>.workers.dev
@@ -138,6 +151,8 @@ Deletes the Cloudflare Worker and removes the local project records.
 - `COLAB_AUTH_FILE` — path to colab-cli auth.json.
 - `COLAB_CLIENT_ID` / `COLAB_CLIENT_SECRET` — override the OAuth client.
 - `COLAB_WF_COMPAT_DATE` — wrangler `compatibility_date`.
+- `COLAB_WF_KEEPALIVE_HOURS` — hours the edge keep-alive cron runs before going
+  no-op (default `8`; `0` disables it). Sets the `KEEPALIVE_UNTIL` deadline.
 
 The Worker source is `assets/worker.js` (copied into each project at publish
 time). Edit it there to change proxy behavior or the unavailable page.

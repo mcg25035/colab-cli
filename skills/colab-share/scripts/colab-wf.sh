@@ -42,21 +42,40 @@ cmd_publish() {
   local ts proj; ts="$(date +%Y%m%d-%H%M%S)"; proj="$WF_HOME/${name}-${ts}"
   mkdir -p "$proj"
   cp "$TEMPLATE" "$proj/worker.js"
+
+  # Keep-alive deadline: a cron pings the runtime's keep-alive endpoint until
+  # this absolute instant, then stops (no-op) so an idle runtime is reclaimed
+  # instead of burning Colab quota forever. Default 8h; override with
+  # COLAB_WF_KEEPALIVE_HOURS (0 disables keep-alive — deadline in the past).
+  local hours="${COLAB_WF_KEEPALIVE_HOURS:-8}"
+  [[ "$hours" =~ ^[0-9]+$ ]] || die "invalid COLAB_WF_KEEPALIVE_HOURS: $hours (integer hours)"
+  local keepalive_until
+  keepalive_until="$(node -e "process.stdout.write(new Date(Date.now()+${hours}*3600e3).toISOString())")"
+
   cat > "$proj/wrangler.toml" <<EOF
 name = "${name}"
 main = "worker.js"
 compatibility_date = "${COMPAT_DATE}"
+
+[triggers]
+crons = ["*/5 * * * *"]
 
 [vars]
 ENDPOINT = "${endpoint}"
 PORT = "${port}"
 CLIENT_ID = "${CLIENT_ID}"
 CLIENT_SECRET = "${CLIENT_SECRET}"
+KEEPALIVE_UNTIL = "${keepalive_until}"
 EOF
+  echo ">> keep-alive: cron */5min until ${keepalive_until} (${hours}h)" >&2
 
   echo ">> deploying Worker '${name}' ..." >&2
   local out; out="$(cd "$proj" && npx --yes wrangler deploy 2>&1)" || { echo "$out" >&2; die "wrangler deploy failed"; }
-  local url; url="$(echo "$out" | grep -oE 'https://[a-z0-9.-]+workers\.dev' | head -1)"
+  # Non-fatal: under `set -euo pipefail` a no-match grep would abort the script
+  # here — i.e. AFTER the Worker is deployed but BEFORE the REFRESH_TOKEN secret
+  # is uploaded, leaving a live-but-broken Worker that 503s forever. Tolerate an
+  # empty URL (e.g. custom-domain-only deploys, or a changed wrangler output).
+  local url; url="$(echo "$out" | grep -oE 'https://[a-z0-9.-]+workers\.dev' | head -1 || true)"
 
   echo ">> uploading REFRESH_TOKEN secret ..." >&2
   local rt; rt="$(read_refresh_token)"
