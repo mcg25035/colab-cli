@@ -86,6 +86,35 @@ see `fetch failed`), run it from the colab-cli repo as
 `node --use-env-proxy dist/index.js runtime list --json` (equivalently
 `npm start -- runtime list --json`). Use whatever form works in this environment.
 
+### Check for existing forwards before publishing
+
+There's no scripted check for this — judge it case by case, the same way you'd
+scan `git status` before a destructive git command. Run `scripts/colab-wf.sh
+list` and skim the results for anything that looks like it serves the *same
+purpose* as what you're about to publish, not just an exact `port`+`endpoint`
+match:
+
+- **Same custom domain.** If the user wants a custom domain (see below), grep
+  the recorded projects for it before deploying:
+  `grep -l '<domain>' ~/.config/colab-cli/worker-forward/*/wrangler.toml`.
+  Cloudflare custom-domain routes are exclusive per zone, so deploying the same
+  route on a new Worker silently steals it from whichever Worker held it —
+  routing self-heals, but the old Worker is left running as dead weight
+  pointing at a route it no longer serves.
+- **Same logical service, different endpoint.** A prior session's runtime may
+  have died and been replaced (`colab runtime list` won't show it anymore),
+  but its Worker — and any custom domain it claimed — is still live on
+  Cloudflare, now permanently serving the "runtime no longer available" page.
+- **Stale by age.** A `created` timestamp far older than the current session,
+  or an `endpoint` absent from `colab runtime list --json`, is a strong signal
+  the forward is orphaned.
+
+If you find a match that looks stale or duplicate, don't delete it
+unprompted — deleting a Cloudflare Worker is a shared/external-state change.
+Tell the user what you found (name, port, endpoint, how old, what makes it
+look stale) and ask whether to `rm` it, either before or after publishing the
+new one.
+
 ### Publish a port
 
 ```bash
@@ -142,6 +171,9 @@ Deletes the Cloudflare Worker and removes the local project records.
   anyone with the URL can reach the service.
 - **One Worker per instance+port**; releasing the instance does not auto-delete
   the Worker — it just starts serving the unavailable page. Clean up with `rm`.
+  Across repeated publishes (e.g. re-deploying the same demo after a runtime
+  died) these accumulate silently since nothing prunes them automatically —
+  see "Check for existing forwards before publishing" above.
 - **WebSocket** is proxied best-effort (passthrough). Plain HTTP is fully tested.
 
 ## Customization knobs (env vars, rarely needed)
