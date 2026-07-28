@@ -21,8 +21,6 @@ import {
   RuntimeProxyToken,
   RuntimeProxyTokenSchema,
   Shape,
-  SessionSchema,
-  Session,
   CredentialsPropagationResult,
   CredentialsPropagationResultSchema,
   isHighMemOnlyAccelerator,
@@ -169,16 +167,6 @@ export class ColabClient {
       ListedAssignmentsSchema,
     );
     return response.assignments;
-  }
-
-  async listSessions(endpoint: string, signal?: AbortSignal): Promise<Session[]> {
-    const url = new URL(`${TUN_ENDPOINT}/${endpoint}/api/sessions`, this.colabDomain);
-    const headers = { [COLAB_TUNNEL_HEADER.key]: COLAB_TUNNEL_HEADER.value };
-    return await this.issueRequest(
-      url,
-      { method: 'GET', headers, signal },
-      z.array(SessionSchema),
-    );
   }
 
   async propagateCredentials(

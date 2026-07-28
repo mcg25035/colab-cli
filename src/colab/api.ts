@@ -261,15 +261,6 @@ export const KernelSchema = z
   }));
 export type Kernel = z.infer<typeof KernelSchema>;
 
-export const SessionSchema = z.object({
-  id: z.string(),
-  kernel: KernelSchema,
-  name: z.string(),
-  path: z.string(),
-  type: z.string(),
-});
-export type Session = z.infer<typeof SessionSchema>;
-
 export const CredentialsPropagationResultSchema = z
   .object({
     success: z.boolean(),
