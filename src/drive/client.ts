@@ -1,6 +1,4 @@
 import { google, drive_v3 } from 'googleapis';
-import { Readable } from 'stream';
-import fs from 'fs';
 
 // --- Types ---
 
@@ -114,34 +112,6 @@ export async function copyDriveItem(
     fields: FILE_FIELDS,
   });
   return mapFile(res.data);
-}
-
-export async function downloadFile(
-  token: string,
-  fileId: string,
-  destPath: string,
-  onProgress?: (bytesDownloaded: number) => void,
-): Promise<void> {
-  const drive = createDriveClient(token);
-  const res = await drive.files.get(
-    { fileId, alt: 'media' },
-    { responseType: 'stream' },
-  );
-
-  const stream = res.data as unknown as Readable;
-  const writeStream = fs.createWriteStream(destPath);
-
-  return new Promise<void>((resolve, reject) => {
-    let bytesDownloaded = 0;
-    stream.on('data', (chunk: Buffer) => {
-      bytesDownloaded += chunk.length;
-      onProgress?.(bytesDownloaded);
-    });
-    stream.on('error', reject);
-    writeStream.on('error', reject);
-    writeStream.on('finish', resolve);
-    stream.pipe(writeStream);
-  });
 }
 
 export async function createFolder(

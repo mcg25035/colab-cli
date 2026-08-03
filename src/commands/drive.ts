@@ -7,7 +7,6 @@ import { createSpinner, isJsonMode, jsonResult, jsonError } from '../output/json
 import {
   listFiles,
   getFileMetadata,
-  downloadFile,
   createFolder,
   trashFile,
   permanentlyDelete,
@@ -18,6 +17,7 @@ import {
   type DriveFileInfo,
 } from '../drive/client.js';
 import { resumableUpload, type DriveUploadProgressEvent } from '../drive/resumable-upload.js';
+import { resumableDownload, type DriveDownloadProgressEvent } from '../drive/resumable-download.js';
 import { formatBytes } from '../transfer/common.js';
 
 // --- Login / Logout / Status ---
@@ -317,20 +317,47 @@ export async function driveDownloadCommand(
     const destPath = path.resolve(options.output || meta.name);
     spinner.text = `Downloading ${meta.name} (${formatBytes(totalBytes)})...`;
 
-    const onProgress = (bytesDownloaded: number): void => {
-      if (totalBytes > 0) {
-        const pct = Math.round((bytesDownloaded / totalBytes) * 100);
-        spinner.text = `Downloading... ${formatBytes(bytesDownloaded)}/${formatBytes(totalBytes)} (${pct}%)`;
-      } else {
-        spinner.text = `Downloading... ${formatBytes(bytesDownloaded)}`;
+    const onProgress = (event: DriveDownloadProgressEvent): void => {
+      switch (event.type) {
+        case 'start': {
+          const resume = event.resumedFrom > 0 ? ` (resuming from ${formatBytes(event.resumedFrom)})` : '';
+          spinner.text = `Downloading ${event.fileName} (${formatBytes(event.totalBytes)})${resume}...`;
+          break;
+        }
+        case 'progress': {
+          if (event.totalBytes > 0) {
+            const pct = Math.round((event.bytesDownloaded / event.totalBytes) * 100);
+            spinner.text = `Downloading... ${formatBytes(event.bytesDownloaded)}/${formatBytes(event.totalBytes)} (${pct}%)`;
+          } else {
+            spinner.text = `Downloading... ${formatBytes(event.bytesDownloaded)}`;
+          }
+          break;
+        }
+        case 'retry':
+          spinner.text = `Download interrupted (${event.reason}) — retry ${event.attempt}/5 in ${Math.round(event.delayMs / 1000)}s...`;
+          break;
+        case 'verifying':
+          spinner.text = 'Verifying checksum...';
+          break;
       }
     };
 
-    await downloadFile(token, fileId, destPath, onProgress);
+    const result = await resumableDownload(token, meta, destPath, { onProgress });
     if (isJsonMode()) {
-      jsonResult({ command: 'drive.download', name: meta.name, localPath: destPath, totalBytes });
+      jsonResult({
+        command: 'drive.download',
+        name: meta.name,
+        localPath: result.destPath,
+        totalBytes: result.totalBytes,
+        resumedFrom: result.resumedFrom,
+        md5Verified: result.md5Verified,
+      });
     } else {
-      spinner.succeed(`Downloaded ${meta.name} -> ${destPath} (${formatBytes(totalBytes)})`);
+      const resumed = result.resumedFrom > 0 ? `, resumed from ${formatBytes(result.resumedFrom)}` : '';
+      const verified = result.md5Verified ? ', md5 verified' : '';
+      spinner.succeed(
+        `Downloaded ${meta.name} -> ${result.destPath} (${formatBytes(result.totalBytes)}${resumed}${verified})`,
+      );
     }
   } catch (err) {
     spinner.fail('Download failed');

@@ -75,6 +75,7 @@ colab-cli/
 │   │   ├── auth.ts                  # DriveAuthManager：独立 OAuth 流程（rclone 凭据）
 │   │   ├── client.ts                # googleapis Drive v3 封装（list/download/mkdir/delete/move）
 │   │   ├── resumable-upload.ts      # 可续传上传（gaxios + 会话持久化）
+│   │   ├── resumable-download.ts    # 可续传下载（HTTP Range + .part 文件）
 │   │   ├── mount-auth.ts            # MountAuthManager：DriveFS OAuth 凭据管理（环境变量驱动）
 │   │   └── mount.ts                 # Drive 挂载执行逻辑（伪 GCE metadata server + DriveFS 启动）
 │   │
@@ -1060,7 +1061,6 @@ function createDriveClient(accessToken: string): drive_v3.Drive
 |---|---|
 | `listFiles(token, parentId?, pageToken?)` | 列出文件夹内容（100 项/页，按 folder+name 排序，也支持查看分享给你的文件） |
 | `getFileMetadata(token, fileId)` | 获取单个文件元数据（含 md5Checksum） |
-| `downloadFile(token, fileId, destPath)` | 流式下载到本地 |
 | `createFolder(token, name, parentId?)` | 创建文件夹 |
 | `trashFile(token, fileId)` | 移至回收站 |
 | `permanentlyDelete(token, fileId)` | 永久删除 |
@@ -1103,7 +1103,44 @@ function createDriveClient(accessToken: string): drive_v3.Drive
 
 **错误重试**：5xx 服务器错误和网络错误使用指数退避重试（最多 5 次，1s/2s/4s/8s/16s）。
 
-### 5.4 自动 Drive 挂载
+### 5.4 可续传下载
+
+`drive/resumable-download.ts` 用 `gaxios` 直接请求 `GET /drive/v3/files/<id>?alt=media` 并携带 `Range` header，而非 googleapis 的高层 `files.get`。原因与 §5.3 相同：需要精确控制 header 与状态码判定。
+
+**下载流程**：
+
+```
+1. getFileMetadata() → 指纹 → partPath；清理其它指纹的残留 part
+2. offset = part 文件大小（> size 则视为脏，丢弃重来）
+3. GET ?alt=media，Range: bytes=<offset>-，Accept-Encoding: identity
+     206 → append 写入 part
+     200 且 offset > 0 → 服务端忽略了 Range，截断 part 从 0 重写
+     416 → offset 已达/超过 EOF；若 part 仍短于 size 则丢弃重来一次
+4. part 大小 == size 后校验 md5Checksum，通过则 rename(part, destPath)
+```
+
+**断点续传（无 state 文件）**：与上传相反，下载不持久化任何 state。上传的 session URI 是服务端生成的不透明句柄，本地推导不出、丢了就得重来；而 `Range` 是无状态的，续传偏移就是 `.part` 文件的实际大小。写一份 `bytesDownloaded` 到 json 反而有害——进程在落盘与写 json 之间被打断时两者必然不一致，而正确答案永远是 part 的实际大小。
+
+part 文件因此是自描述的：**文件名承载身份，文件大小承载进度**。
+
+```
+指纹 = sha256(fileId + "\0" + "md5:" + md5Checksum).slice(0, 12)   // 无 md5 时回退 "st:<size>:<modifiedTime>"
+part  = <destPath>.<指纹>.part
+```
+
+`md5Checksum` 随 Drive 存入新内容而变，因此远端文件被覆盖后指纹随之改变，旧 part 不会被误当作新内容的前缀；换 fileId 下载到同一 `-o` 路径同理。每次下载开始时删除同目录下指纹不匹配的残留 part，不会留下孤儿文件。
+
+**协议踩坑**：
+
+- **必须发 `Accept-Encoding: identity`**。Drive 会对部分内容即时 gzip，而 gaxios 会自动解压——写入磁盘的字节数与 `Range` 所指的偏移不在同一坐标系，续传会静默错位产出损坏文件。
+- **`200` 而非 `206` 必须特判**。服务端忽略 `Range` 时会重发整个文件，此时 append 会造成数据重复，必须以 `'w'` 重写 part。
+- **偏移量每次重新 `statSync`，不信内存计数器**。写流有缓冲，进程被 kill 时内存计数会超前于落盘字节。
+
+**错误重试**：网络错误、429、5xx、流提前关闭使用指数退避重试（最多 5 次，1s/2s/4s/8s/16s），取得进展则重置退避阶梯。另有 60s idle watchdog——断网时 socket 常静默挂起而不报错，而 gaxios 的整体 timeout 会误杀正常的大文件下载。
+
+**完整性校验**：`md5Checksum` 校验通过后才 rename 到最终路径（同目录 rename 原子）。不匹配则删除 part 并报错退出，避免损坏文件冒充完整文件留在最终路径上。
+
+### 5.5 自动 Drive 挂载
 
 自动挂载功能绕过 Colab 的 `propagateCredentials` 流程，在 runtime 内启动一个伪 GCE metadata server 向 DriveFS 提供令牌，实现零浏览器交互的 Drive 挂载。
 
@@ -1194,6 +1231,7 @@ colab-vscode 使用的 Zod 版本允许直接传 TS enum 对象给 `z.enum()`。
 - [ ] `fs rm <path>`：删除 runtime 上的文件或目录。`DELETE /api/contents/<path>`，非空目录需先递归删除子项（参考 vscode 的 `deleteInternal()` 逻辑）或依赖服务端 `recursive` 参数支持。参考：`colab-vscode/src/jupyter/contents/file-system.ts`（`delete()` / `deleteInternal()`）
 - [ ] `fs mv <old-path> <new-path>`：重命名/移动 runtime 上的文件或目录。`PATCH /api/contents/<old-path>` body `{ path: "<new-path>" }`，不需要额外复制或删除。参考：`colab-vscode/src/jupyter/contents/file-system.ts`（`rename()`）、`colab-vscode/src/jupyter/client/generated/apis/ContentsApi.ts`（`contentsRename()`）
 - [x] `colab drive`：Google Drive 文件管理（list/upload/download/mkdir/delete/move）
+- [x] `drive download` 断点续传：HTTP Range + 自描述 `.part` 文件，无 state 文件（见 §5.4）
 - [x] 图片输出：守护进程内由 `image-saver.ts` 立即持久化到 `~/.config/colab-cli/outputs/<serverId>/`，`--output-dir` 可指定目录（CLI 端解析为绝对路径后传递给守护进程）；CLI 端 `terminal-renderer` 仅打印 savedPaths 路径
 - [x] stdin 透传 + Ctrl+C 中断：拦截 `input_request` → readline/raw mode 获取用户输入 → `input_reply`；Ctrl+C → `interrupt` → kernel 中断 → 渲染 traceback
 - [x] 守护进程内 WebSocket 自动重连（Kernel + Terminal 均已实现，指数退避 + ping 保活）
