@@ -59,7 +59,7 @@ export async function portForwardCreateCommand(
   const server = await resolveServer(runtimeManager, options.endpoint);
 
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
   try {
     const result = await client.portForwardCreate(localHost, localPort, remotePort, options.tls);
     if (isJsonMode()) {
@@ -87,7 +87,7 @@ export async function portForwardListCommand(
 ): Promise<void> {
   const server = await resolveServer(runtimeManager, options.endpoint);
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
   try {
     const sessions = await client.portForwardList();
     if (isJsonMode()) {
@@ -121,7 +121,7 @@ export async function portForwardCloseCommand(
   }
   const server = await resolveServer(runtimeManager, options.endpoint);
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
   try {
     let ids: number[];
     if (options.all) {

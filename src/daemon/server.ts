@@ -13,23 +13,37 @@ import { KeepAlive } from '../runtime/keep-alive.js';
 import { ConnectionRefresher } from '../runtime/connection-refresher.js';
 import { getStoredServer, removeStoredServer } from '../runtime/storage.js';
 import { formatRuntimeReleasedMessage } from '../runtime/release-detection.js';
-import { COLAB_API_DOMAIN, COLAB_GAPI_DOMAIN, CONFIG_DIR } from '../config.js';
+import { COLAB_API_DOMAIN, COLAB_GAPI_DOMAIN } from '../config.js';
+import {
+  accountSocketPath,
+  accountPidPath,
+  accountDir,
+  accountExecLogsDir,
+  accountOutputsDir,
+} from '../config.js';
 import type { ClientMessage, ServerMessage, ShellStatus } from './protocol.js';
 import { encode } from './protocol.js';
 import { ExecutionStore } from './execution-store.js';
-import { TerminalConnection } from '../terminal/terminal-connection.js';
-import { TerminalBuffer } from '../terminal/terminal-buffer.js';
 import { ForwardSession } from '../port-forward/session.js';
 import { getTlsCredentials } from '../port-forward/tls.js';
+import {
+  deployPtyRelay,
+  closePtyRelay,
+  killPtyRelay,
+  relaySendStdin,
+  relaySendResize,
+  type PtyRelay,
+} from './pty-relay.js';
 
-const serverId = process.argv[2] as UUID;
-if (!serverId) {
-  console.error('Usage: server.js <server-id>');
+const accountId = process.argv[2];
+const serverId = process.argv[3] as UUID;
+if (!accountId || !serverId) {
+  console.error('Usage: server.js <account-id> <server-id>');
   process.exit(1);
 }
 
-const SOCKET_PATH = path.join(CONFIG_DIR, `daemon-${serverId}.sock`);
-const PID_FILE = path.join(CONFIG_DIR, `daemon-${serverId}.pid`);
+const SOCKET_PATH = accountSocketPath(accountId, serverId);
+const PID_FILE = accountPidPath(accountId, serverId);
 
 function cleanupFiles() {
   // Only remove files we actually own. If another daemon has taken over the
@@ -101,14 +115,12 @@ interface ActiveExecution {
 
 interface ActiveShell {
   shellId: number;
-  tmuxSession: string;
-  connection: TerminalConnection;
-  buffer: TerminalBuffer;
+  relay: PtyRelay;
   attachedSocket?: net.Socket;
   startedAt: Date;
   status: ShellStatus;
-  /** Remote tmux terminal dimensions — last value we sent via sendResize,
-   * used by snapshot rendering to emulate the screen accurately. */
+  /** Last dimensions we advertised to the relay (also mirrored on `relay.buffer`).
+   *  Snapshot rendering reads these so it knows what the bash side thinks it is. */
   cols: number;
   rows: number;
 }
@@ -120,20 +132,27 @@ const MAX_CONCURRENT_SHELLS = 10;
 const MAX_CONCURRENT_PORT_FORWARDS = 20;
 
 /**
- * Colab's `/colab/tty` endpoint auto-attaches every new WebSocket to a fixed
- * server-side tmux session (default `0`) with `attach -d`, which kicks off any
- * prior client. To let multiple shells coexist, each shell is relocated into
- * its own tmux session right after the WebSocket opens — see the `shell_open`
- * handler below.
+ * Per-shell relays are spawned by the daemon via the kernel exec channel
+ * after `shell_open`: one `pty_relay.py` process per shell, listening on
+ * its own port (`SHELL_RELAY_PORT_BASE + shellId * 2`) on the VM. Each
+ * relay owns one PTY + one bash + one websockets server (ttyd protocol),
+ * and exits on bash exit — SSH-style 1:1 lifecycle, no shared state
+ * between shells, so multiple agents can drive their own shell without
+ * any mutex.
  */
-const TMUX_SESSION_PREFIX = 'cli-';
-const SHELL_BOOTSTRAP_SETTLE_MS = 400;
+const SHELL_RELAY_PORT_BASE = 19000;
+const SHELL_CLOSED_RETENTION_MS = 5 * 60 * 1000;
 
 const AUTH_POLL_INTERVAL_MS = 5_000;
 const AUTH_POLL_TIMEOUT_MS = 120_000;
 
 async function main() {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(accountDir(accountId), { recursive: true });
+  // SOCK_PATH may relocate to $XDG_RUNTIME_DIR when the per-account config
+  // dir overflows Linux's 108-byte AF_UNIX sun_path cap; ensure its parent
+  // exists so `server.listen(SOCKET_PATH)` can bind. See config.ts
+  // UNIX_SOCK_PATH_MAX / accountSocketPath.
+  fs.mkdirSync(path.dirname(SOCKET_PATH), { recursive: true });
 
   // Fast exit if a peer daemon is already live — skip the rest of startup.
   // The authoritative claim happens below via claimSocket once the server
@@ -143,16 +162,16 @@ async function main() {
     process.exit(0);
   }
 
-  // Initialize auth
-  const authManager = new AuthManager();
+  // Initialize auth (per-account)
+  const authManager = new AuthManager(accountId);
   await authManager.initialize();
   if (!authManager.isLoggedIn()) {
-    console.error('Not logged in');
+    console.error('Not logged in as', accountId);
     process.exit(1);
   }
 
-  // Load server info
-  const server = getStoredServer(serverId);
+  // Load server info (per-account)
+  const server = getStoredServer(accountId, serverId);
   if (!server) {
     console.error('Server not found:', serverId);
     process.exit(1);
@@ -166,12 +185,13 @@ async function main() {
     () => authManager.logout(),
   );
 
-  const store = new ExecutionStore(serverId);
+  const store = new ExecutionStore(accountId, serverId);
   const execState: { activeExecution?: ActiveExecution } = {};
   const shellState: {
     shells: Map<number, ActiveShell>;
     nextShellId: number;
   } = { shells: new Map(), nextShellId: 1 };
+
   const forwardState: {
     sessions: Map<number, ForwardSession>;
     nextId: number;
@@ -185,7 +205,7 @@ async function main() {
     shuttingDown = true;
 
     if (runtimeReleasedMessage) {
-      removeStoredServer(server.id);
+      removeStoredServer(accountId, server.id);
 
       const active = execState.activeExecution;
       if (active) {
@@ -223,8 +243,11 @@ async function main() {
     }
 
     console.log('Shutting down daemon');
+    // Tear down every live shell relay (WS, port-forward, VM-side process).
     for (const shell of shellState.shells.values()) {
-      shell.connection.close();
+      closePtyRelay(shell.relay, kernel).catch((err) => {
+        console.error(`Shell ${shell.shellId} relay teardown failed:`, err instanceof Error ? err.message : err);
+      });
     }
     shellState.shells.clear();
     for (const session of forwardState.sessions.values()) {
@@ -259,6 +282,7 @@ async function main() {
 
   const refresher = new ConnectionRefresher(
     colabClient,
+    accountId,
     server.id,
     server.endpoint,
     server.token,
@@ -485,7 +509,6 @@ async function main() {
       store,
       runExecution,
       shellState,
-      refresher,
       forwardState,
       colabClient,
       server.endpoint,
@@ -524,7 +547,6 @@ function handleClient(
     shells: Map<number, ActiveShell>;
     nextShellId: number;
   },
-  refresher: ConnectionRefresher,
   forwardState: {
     sessions: Map<number, ForwardSession>;
     nextId: number;
@@ -537,6 +559,27 @@ function handleClient(
   };
 
   send({ type: 'ready' });
+
+  // Mark a live shell as closed: notify its attached driver, drop the
+  // socket reference, then retain the entry briefly so a closing-curve
+  // poll (`shell list`, snapshot attach) still sees the final state
+  // before the relay + entry are evicted. No-op if already closed.
+  const markShellClosed = (shellId: number, reason: string) => {
+    const shell = shellState.shells.get(shellId);
+    if (!shell || shell.status === 'closed') return;
+    shell.status = 'closed';
+    console.log(`Shell ${shellId} closed: ${reason}`);
+    if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
+      shell.attachedSocket.write(encode({ type: 'shell_closed', shellId, reason }));
+    }
+    shell.attachedSocket = undefined;
+    setTimeout(() => {
+      const s = shellState.shells.get(shellId);
+      if (!s) return;
+      closePtyRelay(s.relay, kernel).catch(() => {});
+      shellState.shells.delete(shellId);
+    }, SHELL_CLOSED_RETENTION_MS);
+  };
 
   const rl = readline.createInterface({ input: socket });
   rl.on('error', () => {});
@@ -552,11 +595,22 @@ function handleClient(
       case 'exec': {
         if (execState.activeExecution) {
           const busyId = execState.activeExecution.execId;
+          // Phase 1.13 FIX6: include the daemon's endpoint so the user knows
+          // which runtime the busy execId lives on (exec IDs are per-daemon,
+          // not globally unique). Without this, a `colab exec list` with no
+          // `--endpoint` may resolveTarget to a *different* latest runtime and
+          // return "No executions." — the user is left stranded. Adding the
+          // endpoint here surfaces the canonical hint and removes the ambiguity
+          // observed in the T8 stale-state test session report.
           send({
             type: 'exec_error',
             message:
-              `Daemon is already executing code for another session (exec ${busyId}). ` +
-              `Interrupt it with \`colab exec send ${busyId} --interrupt\` or wait for it to finish.`,
+              `Daemon on runtime ${endpoint} is already executing code for another session (exec ${busyId}). ` +
+              `Inspect it with \`colab exec list -e ${endpoint}\`; ` +
+              `interrupt it with \`colab exec send ${busyId} --interrupt -e ${endpoint}\`; ` +
+              `or wait for it to finish. ` +
+              `(Exec IDs are per-runtime; if you just spawned a new background exec but see this error ` +
+              `without --endpoint, your CLI process likely resolvedTarget to a different daemon.)`,
           });
           return;
         }
@@ -658,7 +712,18 @@ function handleClient(
       case 'exec_send': {
         const active = execState.activeExecution;
         if (!active || active.execId !== msg.execId) {
-          send({ type: 'exec_error', message: `Execution ${msg.execId} is not currently running` });
+          // Phase 1.13 FIX6: exec IDs are per-daemon. If the CLI resolved to
+          // this daemon but the execId isn't currently running here, recommend
+          // `exec list -e <endpoint>` to enumerate what is here and to confirm
+          // the user isn't accidentally targeting the wrong runtime.
+          send({
+            type: 'exec_error',
+            message:
+              `Execution ${msg.execId} is not currently running on runtime ${endpoint}. ` +
+              `Exec IDs are per-runtime — ` +
+              `run \`colab exec list -e ${endpoint}\` to see what's running here, ` +
+              `or specify the correct \`--endpoint\` if you meant a different runtime.`,
+          });
           return;
         }
         if (msg.interrupt) {
@@ -753,7 +818,8 @@ function handleClient(
           send({ type: 'shell_error', message: `Maximum concurrent shell sessions (${MAX_CONCURRENT_SHELLS}) reached` });
           return;
         }
-
+        const cols = msg.cols || DEFAULT_SHELL_COLS;
+        const rows = msg.rows || DEFAULT_SHELL_ROWS;
         const shellId = msg.shellId ?? shellState.nextShellId++;
         if (shellState.shells.has(shellId)) {
           send({ type: 'shell_error', message: `Shell ID ${shellId} already in use` });
@@ -762,113 +828,58 @@ function handleClient(
         if (shellId >= shellState.nextShellId) {
           shellState.nextShellId = shellId + 1;
         }
-        const tmuxSession = `${TMUX_SESSION_PREFIX}${shellId}`;
-        const buffer = new TerminalBuffer(undefined, msg.cols || DEFAULT_SHELL_COLS, msg.rows || DEFAULT_SHELL_ROWS);
 
-        const connection = new TerminalConnection(
-          () => refresher.proxyUrl,
-          () => refresher.token,
-          {
-            onData: (data) => {
-              const shell = shellState.shells.get(shellId);
-              if (!shell) return;
-              shell.buffer.append(data);
-              if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
-                shell.attachedSocket.write(encode({ type: 'shell_output', shellId, data }));
-              }
-            },
-            onOpen: () => {
-              console.log(`Shell ${shellId} connected (tmux session ${tmuxSession})`);
-            },
-            onClose: (code, reason) => {
-              // onClose only fires after all reconnect attempts are exhausted
-              const shell = shellState.shells.get(shellId);
-              if (!shell) return;
-              shell.status = 'closed';
-              if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
-                shell.attachedSocket.write(encode({ type: 'shell_closed', shellId, reason: reason || 'connection closed' }));
-              }
-              console.log(`Shell ${shellId} closed: code=${code} reason=${reason || '(none)'}`);
-              setTimeout(() => {
-                shellState.shells.get(shellId)?.buffer.dispose();
-                shellState.shells.delete(shellId);
-              }, 5 * 60 * 1000);
-            },
-            onError: (err) => {
-              // Errors during reconnect are handled internally; this fires
-              // for non-recoverable errors only (e.g. initial connect failure).
-              const shell = shellState.shells.get(shellId);
-              if (!shell) return;
-              if (shell.connection.isReconnecting) return; // suppress during reconnect
-              shell.status = 'closed';
-              if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
-                shell.attachedSocket.write(encode({ type: 'shell_closed', shellId, reason: err.message }));
-              }
-              console.error(`Shell ${shellId} error:`, err.message);
-              setTimeout(() => {
-                shellState.shells.get(shellId)?.buffer.dispose();
-                shellState.shells.delete(shellId);
-              }, 5 * 60 * 1000);
-            },
-            onReconnecting: (attempt, maxAttempts) => {
-              console.log(`Shell ${shellId} reconnecting (attempt ${attempt}/${maxAttempts})...`);
-            },
-            onReconnected: () => {
-              const shell = shellState.shells.get(shellId);
-              if (!shell) return;
-              console.log(`Shell ${shellId} reconnected, re-attaching tmux session ${tmuxSession}`);
-              // Re-switch to the shell's own tmux session. The tmux session
-              // survived the WS disconnect, so all state is preserved.
-              shell.connection.send(`tmux switch-client -t ${tmuxSession}\n`);
-            },
-          },
-        );
-
-        const shell: ActiveShell = {
-          shellId,
-          tmuxSession,
-          connection,
-          buffer,
-          startedAt: new Date(),
-          status: 'running',
-          cols: msg.cols || DEFAULT_SHELL_COLS,
-          rows: msg.rows || DEFAULT_SHELL_ROWS,
-        };
-        shellState.shells.set(shellId, shell);
-
+        // Per-shell relay: spawn /tmp/pty_relay_<id>.py on the VM (one PTY,
+        // one bash, one websockets server on port SHELL_RELAY_PORT_BASE +
+        // shellId*2), port-forward to it, open a daemon-side WS client. The
+        // relay's WS close = bash exit = shell closed; no traps, no markers,
+        // no shared tmux client, no InputMutex — every shell is fully
+        // independent (SSH-style 1:1 lifecycle).
+        let relay: PtyRelay;
         try {
-          await connection.connect();
-
-          // Relocate this shell into its own tmux session so concurrent shells
-          // on the same runtime don't kick each other off the shared `/colab/tty`
-          // session. `kill-session` guards against a stale session left behind
-          // by a previous daemon instance (nextShellId resets on daemon restart).
-          connection.send(
-            `tmux kill-session -t ${tmuxSession} 2>/dev/null; ` +
-            `tmux new-session -d -s ${tmuxSession}; ` +
-            `tmux set-option -t ${tmuxSession} status off; ` +
-            `tmux switch-client -t ${tmuxSession}\n`,
-          );
-          // Wait for the bootstrap to settle, then drop redraw noise from the
-          // replay buffer. No client is attached yet (shell_opened is sent
-          // below), so this doesn't affect any viewer.
-          await new Promise((r) => setTimeout(r, SHELL_BOOTSTRAP_SETTLE_MS));
-          buffer.clear();
-
-          // Send initial resize if dimensions provided
-          if (msg.cols && msg.rows) {
-            connection.sendResize(msg.cols, msg.rows);
-          }
-          send({ type: 'shell_opened', shellId });
+          relay = await deployPtyRelay({
+            shellId,
+            cols,
+            rows,
+            kernel,
+            kernelReady,
+            colabClient,
+            endpoint,
+            handlers: {
+              onOutput: (text) => {
+                const s = shellState.shells.get(shellId);
+                if (!s || s.status === 'closed') return;
+                if (s.attachedSocket && !s.attachedSocket.destroyed) {
+                  s.attachedSocket.write(encode({ type: 'shell_output', shellId, data: text }));
+                }
+              },
+              onClose: () => {
+                markShellClosed(shellId, 'session ended');
+              },
+              onError: (err) => {
+                console.error(`Shell ${shellId} relay WS error:`, err.message);
+              },
+            },
+          });
         } catch (err) {
-          buffer.dispose();
-          shellState.shells.delete(shellId);
-          connection.close();
           send({
             type: 'shell_error',
             message: `Failed to open shell: ${err instanceof Error ? err.message : String(err)}`,
           });
+          return;
         }
+
+        const shell: ActiveShell = {
+          shellId,
+          relay,
+          startedAt: new Date(),
+          status: 'running',
+          cols,
+          rows,
+        };
+        shellState.shells.set(shellId, shell);
+        console.log(`Shell ${shellId} opened (relay port ${relay.port})`);
+        send({ type: 'shell_opened', shellId });
         break;
       }
 
@@ -878,15 +889,14 @@ function handleClient(
           send({ type: 'shell_error', message: `Shell ${msg.shellId} not found or closed` });
           return;
         }
-        shell.connection.send(msg.data);
+        relaySendStdin(shell.relay, msg.data);
         break;
       }
 
       case 'shell_resize': {
         const shell = shellState.shells.get(msg.shellId);
         if (!shell || shell.status === 'closed') return;
-        shell.connection.sendResize(msg.cols, msg.rows);
-        shell.buffer.resize(msg.cols, msg.rows);
+        relaySendResize(shell.relay, msg.cols, msg.rows);
         shell.cols = msg.cols;
         shell.rows = msg.rows;
         break;
@@ -908,30 +918,37 @@ function handleClient(
         }
 
         if (msg.noWait) {
-          // Snapshot mode: render the buffered output through a virtual screen
-          // so cursor-positioning redraws (tmux forwarding, rich.progress
-          // panels) collapse to the final visible text. `tail` counts lines.
-          const buffered = shell.buffer.getSnapshot(shell.cols, shell.rows, msg.tail);
+          // Snapshot: render the buffered output through the virtual screen
+          // so cursor-positioning redraws (btop TUI, rich progress panels,
+          // tmux status redraws) collapse to the final visible text. `tail`
+          // counts lines. Snapshots never touch the WS — multiple agents
+          // may poll concurrently with the live driver and with each other.
+          const buffered = shell.relay.buffer.getSnapshot(shell.cols, shell.rows, msg.tail);
           send({ type: 'shell_attach_batch', shellId: msg.shellId, buffered, status: shell.status });
         } else {
-          // Streaming mode: attach socket for live output
-          // Detach previous client if any
+          // Streaming: SSH-style "last attach wins". The deposed socket (if
+          // any) is told it's been detached; the new socket becomes the
+          // live forwarder for `shell_output` byte-for-byte. There is NO
+          // input mutex here: any other agent may still call `shell_input`
+          // or `shell_send` and have its bytes interleave with this driver's
+          // keystrokes by design — the worker-of-record (attached socket)
+          // is just the one seeing the rendered output live.
+          if (shell.status === 'closed') {
+            send({ type: 'shell_closed', shellId: msg.shellId, reason: 'session ended before attach' });
+            return;
+          }
           if (shell.attachedSocket && shell.attachedSocket !== socket && !shell.attachedSocket.destroyed) {
             shell.attachedSocket.write(encode({ type: 'shell_closed', shellId: msg.shellId, reason: 'detached by another client' }));
           }
           shell.attachedSocket = socket;
-          const buffered = shell.buffer.getContents();
+
+          const buffered = shell.relay.buffer.getContents();
           send({ type: 'shell_attached', shellId: msg.shellId, buffered });
-          // Send resize to remote terminal if dimensions provided
+
           if (msg.cols && msg.rows && shell.status === 'running') {
-            shell.connection.sendResize(msg.cols, msg.rows);
-            shell.buffer.resize(msg.cols, msg.rows);
+            relaySendResize(shell.relay, msg.cols, msg.rows);
             shell.cols = msg.cols;
             shell.rows = msg.rows;
-          }
-          // If shell already closed, notify immediately
-          if (shell.status === 'closed') {
-            send({ type: 'shell_closed', shellId: msg.shellId, reason: 'session ended before attach' });
           }
         }
         break;
@@ -954,7 +971,11 @@ function handleClient(
           send({ type: 'shell_error', message: `Shell ${msg.shellId} not found or closed` });
           return;
         }
-        shell.connection.send(msg.data);
+        // One-shot programmatic send. Reuses the daemon's already-open WS
+        // client to the relay (no new connection, no race with a concurrent
+        // driver — the relay's PTY-level stdin bytes are atomic and the
+        // kernel sees exactly what we write in order).
+        relaySendStdin(shell.relay, msg.data);
         send({ type: 'shell_send_ack', shellId: msg.shellId });
         break;
       }
@@ -1062,7 +1083,12 @@ function handleClient(
       // Detach the socket but keep the execution running in the daemon.
       active.attachedSocket = undefined;
     }
-    // Detach this socket from any shell sessions (shells keep running)
+    // Detach this socket from any shell sessions (shells keep running).
+    // In the new relay-based architecture each shell owns a long-lived WS
+    // client to its dedicated `pty_relay.py`; a CLI-side socket closing
+    // only stops the live `shell_output` forwarding — the VM-side bash and
+    // its PTY keep running until the user explicitly sends `exit` or the
+    // shell is closed elsewhere.
     for (const shell of shellState.shells.values()) {
       if (shell.attachedSocket === socket) {
         shell.attachedSocket = undefined;

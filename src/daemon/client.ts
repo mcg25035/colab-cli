@@ -22,12 +22,12 @@ export class DaemonClient {
   private waitResolve?: () => void;
   private closed = false;
 
-  async connect(serverId: UUID): Promise<void> {
-    if (!(await isDaemonRunning(serverId))) {
-      await startDaemon(serverId);
+  async connect(accountId: string, serverId: UUID): Promise<void> {
+    if (!(await isDaemonRunning(accountId, serverId))) {
+      await startDaemon(accountId, serverId);
     }
 
-    const socketPath = getSocketPath(serverId);
+    const socketPath = getSocketPath(accountId, serverId);
     this.socket = await new Promise<net.Socket>((resolve, reject) => {
       const sock = net.connect(socketPath, () => resolve(sock));
       sock.on('error', reject);

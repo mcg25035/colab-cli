@@ -7,7 +7,7 @@ import { handleEphemeralAuth } from '../auth/ephemeral.js';
 import { DaemonClient } from '../daemon/client.js';
 import { renderOutput, renderStream } from '../output/terminal-renderer.js';
 import { RuntimeManager } from '../runtime/runtime-manager.js';
-import { createSpinner, isJsonMode, setJsonMode } from '../output/json-output.js';
+import { createSpinner, isJsonMode, jsonResult, setJsonMode } from '../output/json-output.js';
 
 function formatElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -86,7 +86,7 @@ export async function execCommand(
   const spinner = createSpinner('Connecting to daemon...').start();
   const client = new DaemonClient();
   try {
-    await client.connect(server.id);
+    await client.connect(server.accountId!, server.id);
     spinner.stop();
   } catch (err) {
     spinner.fail('Failed to connect to daemon');
@@ -164,7 +164,7 @@ export async function execBgCommand(
   const spinner = createSpinner('Connecting to daemon...').start();
   const client = new DaemonClient();
   try {
-    await client.connect(server.id);
+    await client.connect(server.accountId!, server.id);
     spinner.stop();
   } catch (err) {
     spinner.fail('Failed to connect to daemon');
@@ -193,7 +193,7 @@ export async function execAttachCommand(
   const server = await runtimeManager.resolveTarget(options.endpoint);
 
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
 
   // --tail implies --no-wait
   const noWait = options.noWait || options.tail !== undefined;
@@ -271,10 +271,25 @@ export async function execListCommand(
   const server = await runtimeManager.resolveTarget(options.endpoint);
 
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
 
   try {
     const executions = await client.execList();
+    if (isJsonMode()) {
+      jsonResult({
+        command: 'exec.list',
+        endpoint: server.endpoint,
+        executions: executions.map((e) => ({
+          execId: e.execId,
+          status: e.status,
+          code: e.code,
+          startedAt: e.startedAt,
+          finishedAt: e.finishedAt ?? null,
+          outputCount: e.outputCount,
+        })),
+      });
+      return;
+    }
     if (executions.length === 0) {
       console.log('No executions.');
       return;
@@ -312,7 +327,7 @@ export async function execSendCommand(
   const server = await runtimeManager.resolveTarget(options.endpoint);
 
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
 
   try {
     await client.execSend(execId, {
@@ -332,7 +347,7 @@ export async function execClearCommand(
   const server = await runtimeManager.resolveTarget(options.endpoint);
 
   const client = new DaemonClient();
-  await client.connect(server.id);
+  await client.connect(server.accountId!, server.id);
 
   try {
     const count = await client.execClear(execId);

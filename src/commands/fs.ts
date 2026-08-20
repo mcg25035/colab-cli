@@ -16,12 +16,13 @@ async function resolveServer(
 }
 
 function makeConnectionProvider(server: StoredServer): ConnectionProvider {
+  const accountId = server.accountId!;
   return {
     getProxyUrl() {
-      return getStoredServer(server.id)?.proxyUrl ?? server.proxyUrl;
+      return getStoredServer(accountId, server.id)?.proxyUrl ?? server.proxyUrl;
     },
     getToken() {
-      return getStoredServer(server.id)?.token ?? server.token;
+      return getStoredServer(accountId, server.id)?.token ?? server.token;
     },
   };
 }
@@ -65,7 +66,7 @@ export async function fsUploadCommand(
 
   if (strategy === 'chunked') {
     daemonClient = new DaemonClient();
-    await daemonClient.connect(server.id);
+    await daemonClient.connect(server.accountId!, server.id);
     execOnKernel = makeDaemonExec(daemonClient);
   } else {
     execOnKernel = async () => '';
@@ -127,7 +128,7 @@ export async function fsDownloadCommand(
   const getExecOnKernel = async (): Promise<(code: string) => Promise<string>> => {
     if (!daemonClient) {
       daemonClient = new DaemonClient();
-      await daemonClient.connect(server.id);
+      await daemonClient.connect(server.accountId!, server.id);
     }
     return makeDaemonExec(daemonClient);
   };
