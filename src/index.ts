@@ -44,10 +44,13 @@ import {
   driveLogoutCommand,
   driveStatusCommand,
   driveListCommand,
+  driveInfoCommand,
   driveUploadCommand,
   driveDownloadCommand,
   driveMkdirCommand,
   driveDeleteCommand,
+  driveCopyCommand,
+  driveRenameCommand,
   driveMoveCommand,
 } from './commands/drive.js';
 import { DriveAuthManager } from './drive/auth.js';
@@ -503,6 +506,14 @@ drive
   });
 
 drive
+  .command('info <item-id>')
+  .description('show metadata for a Google Drive file or folder')
+  .action(async (itemId) => {
+    const da = await ensureDriveLoggedIn();
+    await driveInfoCommand(da, itemId);
+  });
+
+drive
   .command('upload <local-path>')
   .description('upload a file to Google Drive (best for large files)')
   .option('-p, --parent <folder-id>', 'parent folder ID (default: root)')
@@ -539,9 +550,27 @@ drive
   });
 
 drive
+  .command('copy <file-id>')
+  .description('copy a file on Google Drive (destination defaults to My Drive root)')
+  .option('--to <folder-id>', 'destination folder ID (default: root)')
+  .option('--name <name>', 'name for the copied file')
+  .action(async (itemId, opts) => {
+    const da = await ensureDriveLoggedIn();
+    await driveCopyCommand(da, itemId, opts);
+  });
+
+drive
+  .command('rename <item-id> <new-name>')
+  .description('rename a file or folder on Google Drive')
+  .action(async (itemId, newName) => {
+    const da = await ensureDriveLoggedIn();
+    await driveRenameCommand(da, itemId, newName);
+  });
+
+drive
   .command('move <item-id>')
   .description(
-    'move a file or folder on Google Drive (shared items you do not own are copied instead)',
+    'move a file or folder in My Drive (non-owned shared files are copied instead)',
   )
   .requiredOption('--to <folder-id>', 'destination folder ID')
   .action(async (itemId, opts) => {

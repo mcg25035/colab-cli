@@ -7,12 +7,23 @@ export interface DriveFileInfo {
   name: string;
   mimeType: string;
   size?: string;
+  createdTime?: string;
   modifiedTime?: string;
+  description?: string;
+  trashed?: boolean;
   parents?: string[];
+  driveId?: string;
   md5Checksum?: string;
   ownedByMe?: boolean;
   ownerEmail?: string;
   ownerDisplayName?: string;
+  capabilities?: {
+    canCopy?: boolean;
+    canEdit?: boolean;
+    canRename?: boolean;
+    canMoveItemWithinDrive?: boolean;
+    canMoveItemOutOfDrive?: boolean;
+  };
 }
 
 export interface DriveListResult {
@@ -29,7 +40,22 @@ const FOLDER_MIME = 'application/vnd.google-apps.folder';
  */
 export const SHARED_WITH_ME_ID = 'shared';
 
-const FILE_FIELDS = 'id, name, mimeType, size, modifiedTime, parents, md5Checksum, ownedByMe, owners(displayName,emailAddress)';
+const FILE_FIELDS = [
+  'id',
+  'name',
+  'mimeType',
+  'size',
+  'createdTime',
+  'modifiedTime',
+  'description',
+  'trashed',
+  'parents',
+  'driveId',
+  'md5Checksum',
+  'ownedByMe',
+  'owners(displayName,emailAddress)',
+  'capabilities(canCopy,canEdit,canRename,canMoveItemWithinDrive,canMoveItemOutOfDrive)',
+].join(', ');
 
 function mapFile(f: drive_v3.Schema$File): DriveFileInfo {
   const owner = f.owners?.[0];
@@ -38,12 +64,23 @@ function mapFile(f: drive_v3.Schema$File): DriveFileInfo {
     name: f.name!,
     mimeType: f.mimeType!,
     size: f.size ?? undefined,
+    createdTime: f.createdTime ?? undefined,
     modifiedTime: f.modifiedTime ?? undefined,
+    description: f.description ?? undefined,
+    trashed: f.trashed ?? undefined,
     parents: (f.parents as string[]) ?? undefined,
+    driveId: f.driveId ?? undefined,
     md5Checksum: f.md5Checksum ?? undefined,
     ownedByMe: f.ownedByMe ?? undefined,
     ownerEmail: owner?.emailAddress ?? undefined,
     ownerDisplayName: owner?.displayName ?? undefined,
+    capabilities: f.capabilities ? {
+      canCopy: f.capabilities.canCopy ?? undefined,
+      canEdit: f.capabilities.canEdit ?? undefined,
+      canRename: f.capabilities.canRename ?? undefined,
+      canMoveItemWithinDrive: f.capabilities.canMoveItemWithinDrive ?? undefined,
+      canMoveItemOutOfDrive: f.capabilities.canMoveItemOutOfDrive ?? undefined,
+    } : undefined,
   };
 }
 
@@ -92,6 +129,7 @@ export async function getFileMetadata(
   const res = await drive.files.get({
     fileId,
     fields: FILE_FIELDS,
+    supportsAllDrives: true,
   });
   return mapFile(res.data);
 }
@@ -105,6 +143,7 @@ export async function copyDriveItem(
   const drive = createDriveClient(token);
   const res = await drive.files.copy({
     fileId,
+    supportsAllDrives: true,
     requestBody: {
       parents: [newParentId],
       ...(newName ? { name: newName } : {}),
@@ -160,6 +199,21 @@ export async function moveDriveItem(
     removeParents: previousParents,
     fields: 'id, parents',
   });
+}
+
+export async function renameDriveItem(
+  token: string,
+  itemId: string,
+  newName: string,
+): Promise<DriveFileInfo> {
+  const drive = createDriveClient(token);
+  const res = await drive.files.update({
+    fileId: itemId,
+    supportsAllDrives: true,
+    requestBody: { name: newName },
+    fields: FILE_FIELDS,
+  });
+  return mapFile(res.data);
 }
 
 export async function findFileByName(

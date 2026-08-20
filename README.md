@@ -220,10 +220,13 @@ colab drive login                             # authorize Google Drive access
 colab drive logout                            # remove stored credentials
 colab drive status                            # show authorization status
 colab drive list [folder-id]                  # list files (default: root)
+colab drive info <item-id>                    # show file or folder metadata
 colab drive upload <local-path> [-p <id>]     # upload file (resumable for >5 MiB)
 colab drive download <file-id> [-o <path>]    # download file
 colab drive mkdir <name> [-p <id>]            # create folder
 colab drive delete <file-id> [--permanent]    # delete (default: trash)
+colab drive copy <file-id> [--to <id>] [--name <name>] # copy file (default: root)
+colab drive rename <item-id> <new-name>       # rename file or folder
 colab drive move <item-id> --to <folder-id>   # move file or folder
 ```
 
@@ -244,6 +247,8 @@ colab drive list shared
 
 - `drive move` on a file you don't own falls back to a copy; `--json` output includes `"mode": "moved"` or `"mode": "copied"`.
 - `drive delete` is rejected for files you don't own.
+- `drive copy` supports regular files stored in Shared Drives when your account has copy permission. Google Drive does not support copying folders.
+- `drive move` deliberately rejects moves within, into, or out of Shared Drives.
 
 #### Custom OAuth Credentials
 

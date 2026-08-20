@@ -1387,10 +1387,13 @@ drive login
 drive logout
 drive status
 drive list [folder-id]
+drive info <item-id>
 drive upload <local-path> [-p <folder-id>]
 drive download <file-id> [-o <path>]
 drive mkdir <name> [-p <folder-id>]
 drive delete <file-id> [--permanent]
+drive copy <file-id> [--to <folder-id>] [--name <name>]
+drive rename <item-id> <new-name>
 drive move <item-id> --to <folder-id>
 drive-mount                                          # 需要 COLAB_DRIVEFS 环境变量
 drive-mount login

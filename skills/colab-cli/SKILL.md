@@ -231,9 +231,13 @@ colab fs download content/output.bin --output ./local-output.bin
 ```bash
 colab drive list
 colab drive list <folder-id>
+colab drive info <item-id>
 colab drive upload ./dataset.zip --parent <folder-id>
 colab drive download <file-id> --output ./dataset.zip
 colab drive mkdir "checkpoints" --parent <folder-id>
+colab drive copy <file-id> --to <folder-id>
+colab drive copy <file-id> --to root --name <new-name>
+colab drive rename <item-id> <new-name>
 colab drive move <item-id> --to <folder-id>
 colab drive delete <file-id>
 colab drive delete <file-id> --permanent
@@ -242,6 +246,8 @@ colab drive delete <file-id> --permanent
 - `colab drive` has its own OAuth session and does not rely on `colab auth login`.
 - Drive commands use file IDs and folder IDs, not human-readable names or path strings. If the user only knows a name, list the folder first to find the ID.
 - Use `colab drive list shared` to browse files shared with you. `drive move` on an item you don't own falls back to a copy instead of moving.
+- `drive copy` defaults to the My Drive root and supports files in Shared Drives when the user has copy permission. Folders cannot be copied through the Drive API.
+- `drive move` does not operate within, into, or out of Shared Drives.
 - `drive upload` is resumable for large files and can continue after interruption by re-running the same command.
 - For large assets, durable storage, or workflows that rely on `drive.mount('/content/drive')`, prefer `colab drive` over `colab fs`.
 

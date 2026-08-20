@@ -12,6 +12,7 @@ import {
   permanentlyDelete,
   moveDriveItem,
   copyDriveItem,
+  renameDriveItem,
   FOLDER_MIME,
   SHARED_WITH_ME_ID,
   type DriveFileInfo,
@@ -86,8 +87,8 @@ export async function driveStatusCommand(
  * Drive IDs: [a-zA-Z0-9_-] only, typically 19–44 chars, minimum ~10.
  */
 function warnIfNotId(value: string, label: string): void {
-  // Allow our virtual sentinel ("shared") through without complaint.
-  if (value === SHARED_WITH_ME_ID) return;
+  // Allow Drive's root alias and our virtual sentinel through without complaint.
+  if (value === 'root' || value === SHARED_WITH_ME_ID) return;
 
   // Contains characters outside the Drive ID charset
   const badChars = /[^a-zA-Z0-9_-]/.test(value);
@@ -200,6 +201,56 @@ export async function driveListCommand(
 
 function displayName(name: string, mimeType: string): string {
   return mimeType === FOLDER_MIME ? name + '/' : name;
+}
+
+// --- Info ---
+
+export async function driveInfoCommand(
+  driveAuth: DriveAuthManager,
+  itemId: string,
+): Promise<void> {
+  if (itemId === SHARED_WITH_ME_ID) {
+    const msg = '"shared" is a virtual folder, not a real Drive item.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  warnIfNotId(itemId, 'item ID');
+  const token = await driveAuth.getAccessToken();
+  const spinner = createSpinner('Fetching item info...').start();
+
+  try {
+    const meta = await getFileMetadata(token, itemId);
+    spinner.stop();
+    if (isJsonMode()) {
+      jsonResult({
+        command: 'drive.info',
+        ...meta,
+        size: meta.size ? parseInt(meta.size, 10) : undefined,
+      });
+      return;
+    }
+
+    const rows: Array<[string, string | undefined]> = [
+      ['ID', meta.id],
+      ['Name', meta.name],
+      ['Type', meta.mimeType === FOLDER_MIME ? 'folder' : meta.mimeType],
+      ['Size', meta.size === undefined ? undefined : formatBytes(parseInt(meta.size, 10))],
+      ['Created', meta.createdTime],
+      ['Modified', meta.modifiedTime],
+      ['Parents', meta.parents?.join(', ')],
+      ['Shared drive', meta.driveId],
+      ['Owner', meta.ownerEmail || meta.ownerDisplayName],
+      ['MD5', meta.md5Checksum],
+      ['Trashed', meta.trashed === undefined ? undefined : String(meta.trashed)],
+      ['Description', meta.description],
+    ];
+    for (const [label, value] of rows) {
+      if (value !== undefined) console.log(`${label}: ${value}`);
+    }
+  } catch (err) {
+    spinner.fail('Failed to fetch item info');
+    throw err;
+  }
 }
 
 // --- Upload ---
@@ -451,6 +502,114 @@ export async function driveDeleteCommand(
   }
 }
 
+// --- Copy ---
+
+export async function driveCopyCommand(
+  driveAuth: DriveAuthManager,
+  itemId: string,
+  options: { to?: string; name?: string },
+): Promise<void> {
+  if (itemId === SHARED_WITH_ME_ID) {
+    const msg = '"shared" is a virtual folder, not a real Drive item. It cannot be copied.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  if (options.to !== undefined && options.to.trim() === '') {
+    const msg = '--to is empty. Provide a valid destination folder ID or omit it to use My Drive root.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  if (options.to === SHARED_WITH_ME_ID) {
+    const msg = '"shared" is a virtual folder and cannot be used as a destination.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  if (options.name !== undefined && options.name.trim() === '') {
+    const msg = '--name cannot be empty.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+
+  const toFolder = options.to || 'root';
+  warnIfNotId(itemId, 'item ID');
+  warnIfNotId(toFolder, 'folder ID');
+  const token = await driveAuth.getAccessToken();
+  const spinner = createSpinner('Copying...').start();
+
+  try {
+    const meta = await getFileMetadata(token, itemId);
+    if (meta.mimeType === FOLDER_MIME) {
+      spinner.fail('Google Drive cannot copy folders. Copy the folder contents individually.');
+      process.exit(1);
+    }
+    if (meta.capabilities?.canCopy === false) {
+      spinner.fail(`You do not have permission to copy "${meta.name}".`);
+      process.exit(1);
+    }
+    const copied = await copyDriveItem(token, itemId, toFolder, options.name);
+    if (isJsonMode()) {
+      jsonResult({
+        command: 'drive.copy',
+        sourceItemId: itemId,
+        toFolder,
+        newFileId: copied.id,
+        name: copied.name,
+        driveId: copied.driveId,
+      });
+    } else {
+      spinner.succeed(`Copied "${meta.name}" to ${toFolder} as "${copied.name}" (new ID: ${copied.id})`);
+    }
+  } catch (err) {
+    spinner.fail('Copy failed');
+    throw err;
+  }
+}
+
+// --- Rename ---
+
+export async function driveRenameCommand(
+  driveAuth: DriveAuthManager,
+  itemId: string,
+  newName: string,
+): Promise<void> {
+  if (itemId === SHARED_WITH_ME_ID) {
+    const msg = '"shared" is a virtual folder, not a real Drive item. It cannot be renamed.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  if (newName.trim() === '') {
+    const msg = 'New name cannot be empty.';
+    if (isJsonMode()) jsonError(msg); else console.error(msg);
+    process.exit(1);
+  }
+  warnIfNotId(itemId, 'item ID');
+  const token = await driveAuth.getAccessToken();
+  const spinner = createSpinner('Renaming...').start();
+
+  try {
+    const before = await getFileMetadata(token, itemId);
+    if (before.capabilities?.canRename === false) {
+      spinner.fail(`You do not have permission to rename "${before.name}".`);
+      process.exit(1);
+    }
+    const renamed = await renameDriveItem(token, itemId, newName);
+    if (isJsonMode()) {
+      jsonResult({
+        command: 'drive.rename',
+        itemId,
+        oldName: before.name,
+        newName: renamed.name,
+        driveId: renamed.driveId,
+      });
+    } else {
+      spinner.succeed(`Renamed "${before.name}" to "${renamed.name}" (${itemId})`);
+    }
+  } catch (err) {
+    spinner.fail('Rename failed');
+    throw err;
+  }
+}
+
 // --- Move ---
 
 export async function driveMoveCommand(
@@ -480,7 +639,23 @@ export async function driveMoveCommand(
     // is impossible: the item has no parent in the user's namespace to remove
     // from. We transparently fall back to a copy into the destination folder
     // and tell the user exactly what happened.
+    const destination = await getFileMetadata(token, toFolder);
+    if (destination.mimeType !== FOLDER_MIME) {
+      spinner.fail(`Move destination "${destination.name}" is not a folder.`);
+      process.exit(1);
+    }
+    if (meta.driveId || destination.driveId) {
+      spinner.fail('Moving items within, into, or out of a Shared Drive is not supported.');
+      process.exit(1);
+    }
+
     if (meta.ownedByMe === false) {
+      if (meta.mimeType === FOLDER_MIME) {
+        spinner.fail(
+          'This shared folder cannot be moved because you do not own it, and Google Drive cannot copy folders.',
+        );
+        process.exit(1);
+      }
       spinner.text = 'Copying (item is shared, cannot be moved)...';
       const copied = await copyDriveItem(token, itemId, toFolder);
       const ownerLabel = meta.ownerEmail || meta.ownerDisplayName || 'someone else';
