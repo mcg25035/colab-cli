@@ -17,6 +17,7 @@ export class ConnectionRefresher {
 
   constructor(
     private readonly colabClient: ColabClient,
+    private readonly accountId: string,
     private readonly serverId: UUID,
     private readonly endpoint: string,
     token: string,
@@ -66,7 +67,7 @@ export class ConnectionRefresher {
     this.currentToken = result.token;
     this.currentProxyUrl = result.url;
     this.tokenExpiry = new Date(Date.now() + result.tokenExpiresInSeconds * 1000);
-    updateServerToken(this.serverId, result.token, result.url, this.tokenExpiry);
+    updateServerToken(this.accountId, this.serverId, result.token, result.url, this.tokenExpiry);
     log.debug('Connection token refreshed, expires:', this.tokenExpiry.toISOString());
     this.scheduleRefresh();
   }
