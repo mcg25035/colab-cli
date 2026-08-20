@@ -11,19 +11,16 @@ import {
   DRIVE_CLIENT_ID,
   DRIVE_CLIENT_SECRET,
   DRIVE_SCOPES,
-  DRIVEFS_CLIENT_ID,
-  DRIVEFS_CLIENT_SECRET,
-  DRIVEFS_SCOPES,
-  CONFIG_DIR,
-  DRIVE_AUTH_FILE,
-  DRIVE_MOUNT_AUTH_FILE,
+  accountDir,
+  accountDriveAuthFile,
 } from '../config.js';
-import { getStoredSession, storeSession } from './storage.js';
+import { getStoredSession, storeSession, RefreshableSession } from './storage.js';
+import { registerAccount, setActiveAccountEmail } from './accounts-registry.js';
 import { LoopbackServer, type LoopbackHandler } from './loopback-server.js';
 import { EXCHANGE_TIMEOUT_MS } from './loopback-flow.js';
 import { jsonResult } from '../output/json-output.js';
 
-export type BackgroundAuthType = 'colab' | 'drive' | 'drive-mount';
+export type BackgroundAuthType = 'colab' | 'drive';
 
 interface AuthConfig {
   clientId: string;
@@ -44,15 +41,6 @@ function getAuthConfig(authType: BackgroundAuthType): AuthConfig {
         clientId: DRIVE_CLIENT_ID,
         clientSecret: DRIVE_CLIENT_SECRET,
         scopes: [...DRIVE_SCOPES],
-      };
-    case 'drive-mount':
-      if (!DRIVEFS_CLIENT_ID || !DRIVEFS_CLIENT_SECRET) {
-        throw new Error('Drive mount credentials not configured');
-      }
-      return {
-        clientId: DRIVEFS_CLIENT_ID,
-        clientSecret: DRIVEFS_CLIENT_SECRET,
-        scopes: [...DRIVEFS_SCOPES],
       };
   }
 }
@@ -227,7 +215,7 @@ async function runAuthCallbackDaemon(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Credential storage (mirrors logic in AuthManager / DriveAuthManager / MountAuthManager)
+// Credential storage (mirrors logic in AuthManager / DriveAuthManager)
 // ---------------------------------------------------------------------------
 
 async function fetchUserInfo(token: string): Promise<{ name: string; email: string }> {
@@ -267,31 +255,27 @@ async function saveCredentials(
   switch (authType) {
     case 'colab': {
       const user = await fetchUserInfo(accessToken);
-      const existing = getStoredSession();
-      storeSession({
+      const existing = getStoredSession(user.email);
+      const session: RefreshableSession = {
         id: existing?.id ?? uuid(),
         refreshToken,
         account: { id: user.email, label: user.name },
         scopes: [...REQUIRED_SCOPES].sort(),
-      });
+      };
+      storeSession(session);
+      // Background auth is the --json non-blocking path. Register + activate
+      // the account so subsequent `colab` invocations see it.
+      registerAccount(user.email, user.name);
+      setActiveAccountEmail(user.email);
       break;
     }
     case 'drive': {
       const email = await fetchEmail(accessToken);
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
+      if (!email) throw new Error('Drive auth: could not resolve email from access token');
+      fs.mkdirSync(accountDir(email), { recursive: true });
       fs.writeFileSync(
-        DRIVE_AUTH_FILE,
+        accountDriveAuthFile(email),
         JSON.stringify({ refreshToken, clientId: DRIVE_CLIENT_ID, email }, null, 2),
-        { mode: 0o600 },
-      );
-      break;
-    }
-    case 'drive-mount': {
-      const email = await fetchEmail(accessToken);
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
-      fs.writeFileSync(
-        DRIVE_MOUNT_AUTH_FILE,
-        JSON.stringify({ refreshToken, clientId: DRIVEFS_CLIENT_ID, email }, null, 2),
         { mode: 0o600 },
       );
       break;
