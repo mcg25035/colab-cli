@@ -40,6 +40,28 @@ import {
 
 const XSSI_PREFIX = ")]}'\n";
 const TUN_ENDPOINT = '/tun/m';
+/** Bug #3: max retries for a transient 503 on assign POST. */
+const ASSIGN_503_MAX_ATTEMPTS = 3;
+/** Bug #3: delay between assign POST retries (abortable via signal). */
+const ASSIGN_503_RETRY_DELAY_MS = 1_000;
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Aborted'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('Aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 interface AssignmentToken extends GetAssignmentResponse {
   kind: 'to_assign';
@@ -107,6 +129,9 @@ export class ColabClient {
             throw new TooManyAssignmentsError(error.message);
           }
           if (error instanceof ColabRequestError && error.status === 503) {
+            // Bug #3: all retry attempts exhausted. Don't blame the
+            // accelerator — a 503 after retries usually means temporary
+            // capacity or an exhausted CCU quota, so point at `colab usage`.
             throw new AcceleratorUnavailableError(
               params.accelerator ?? 'default',
             );
@@ -279,15 +304,36 @@ export class ColabClient {
     signal?: AbortSignal,
   ): Promise<PostAssignmentResponse> {
     const url = this.buildAssignUrl(notebookHash, params);
-    return await this.issueRequest(
-      url,
-      {
-        method: 'POST',
-        headers: { [COLAB_XSRF_TOKEN_HEADER.key]: xsrfToken },
-        signal,
-      },
-      PostAssignmentResponseSchema,
-    );
+    // Post-test Bug #3: a transient backend 503 (observed on `runtime create`
+    // with standard/high-ram combos) used to surface as an immediately fatal
+    // "Requested accelerator "X" is unavailable", which is misleading — the
+    // accelerator wasn't invalid, Colab just couldn't provision right now.
+    // Retry the POST up to 3 times before giving up. Each attempt stays
+    // abortable via `signal`.
+    for (let attempt = 1; attempt <= ASSIGN_503_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.issueRequest(
+          url,
+          {
+            method: 'POST',
+            headers: { [COLAB_XSRF_TOKEN_HEADER.key]: xsrfToken },
+            signal,
+          },
+          PostAssignmentResponseSchema,
+        );
+      } catch (error) {
+        const is503 = error instanceof ColabRequestError && error.status === 503;
+        if (!is503 || attempt === ASSIGN_503_MAX_ATTEMPTS) {
+          throw error;
+        }
+        log.warn(
+          `Assign POST returned 503 (attempt ${attempt}/${ASSIGN_503_MAX_ATTEMPTS}); retrying in ${ASSIGN_503_RETRY_DELAY_MS}ms`,
+        );
+        await sleepAbortable(ASSIGN_503_RETRY_DELAY_MS, signal);
+      }
+    }
+    // Unreachable: the loop returns or throws on the last attempt.
+    throw new Error('unreachable');
   }
 
   private buildAssignUrl(
@@ -331,6 +377,20 @@ export class ColabClient {
     schema?: z.ZodType,
     { requireAccessToken = true }: IssueRequestOptions = {},
   ): Promise<unknown> {
+    // The `authuser` query param is a *browser* multi-account session hint —
+    // colab.research.google.com's web frontend uses it to pick which of the
+    // browser's logged-in Google accounts to handle a request via session
+    // cookies. This CLI has no browser session: user identity authoritative-
+    // ly comes from the per-request `Authorization: Bearer <access_token>`
+    // header below, and each account owns its own access_token (Phase 1).
+    //
+    // BUT the Colab `/tun/m/assign` endpoint empirically rejects requests
+    // with `authuser` absent (HTTP 400), so we must include it as a formality
+    // on colab.research.google.com requests. The value `0` is the standard
+    // CLI convention taken from colab-vscode; in CLI context it doesn't
+    // select between Google accounts (Bearer does), so multi-account
+    // processes all set `authuser=0` and don't collide — backend maps by
+    // Bearer. (Phase 1.8 regression report root cause.)
     if (endpoint.hostname === this.colabDomain.hostname) {
       endpoint.searchParams.set('authuser', '0');
     }
@@ -396,7 +456,11 @@ export class TooManyAssignmentsError extends Error {}
 /** Error thrown when the requested machine accelerator is unavailable. */
 export class AcceleratorUnavailableError extends Error {
   constructor(readonly requested: string) {
-    super(`Requested accelerator "${requested}" is unavailable`);
+    super(
+      `Colab could not allocate a runtime for accelerator "${requested}" (backend 503, retried 3 times). ` +
+      `This is usually a temporary capacity issue or an exhausted CCU quota — ` +
+      `check your remaining quota with \`colab usage\`, then try again later.`,
+    );
   }
 }
 
