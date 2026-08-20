@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type { AuthType } from '../colab/api.js';
 import type { KernelOutput } from '../jupyter/kernel-connection.js';
-import { CONFIG_DIR } from '../config.js';
+import { accountExecLogsDir, accountOutputsDir } from '../config.js';
 import { saveOutputImages } from './image-saver.js';
 
 export type ExecStatus = 'running' | 'input' | 'auth' | 'done' | 'error' | 'crashed';
@@ -51,9 +51,9 @@ export class ExecutionStore {
   /** Default output dir when caller doesn't pass one to create(). */
   private readonly defaultOutputDir: string;
 
-  constructor(serverId: string) {
-    this.logDir = path.join(CONFIG_DIR, `exec-logs-${serverId}`);
-    this.defaultOutputDir = path.join(CONFIG_DIR, 'outputs', serverId);
+  constructor(accountId: string, serverId: string) {
+    this.logDir = accountExecLogsDir(accountId, serverId);
+    this.defaultOutputDir = accountOutputsDir(accountId, serverId);
     fs.mkdirSync(this.logDir, { recursive: true });
     this.nextId = this.recoverNextId();
   }

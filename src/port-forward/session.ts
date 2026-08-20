@@ -8,15 +8,20 @@ import type { TlsCredentials } from './tls.js';
 export class ForwardSession {
   readonly startedAt = new Date();
   readonly tls: boolean;
+  readonly localPort: number;
 
   private constructor(
     readonly id: number,
     readonly localHost: string,
-    readonly localPort: number,
+    localPort: number,
     readonly remotePort: number,
     private readonly refresher: PortTokenRefresher,
     private readonly server: http.Server | https.Server,
   ) {
+    // `localPort` may have been 0 (OS-assigned); record the real bound port
+    // so callers can connect to it (e.g. shell bridges on 127.0.0.1).
+    const address = server.address();
+    this.localPort = typeof address === 'object' && address !== null ? address.port : localPort;
     this.tls = server instanceof https.Server;
   }
 

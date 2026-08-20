@@ -304,7 +304,7 @@ export async function restartRuntimeCommand(
   const spinner = createSpinner('Restarting kernel...').start();
   const client = new DaemonClient();
   try {
-    await client.connect(server.id);
+    await client.connect(server.accountId!, server.id);
     await client.restart();
     if (isJsonMode()) {
       jsonResult({ command: 'runtime.restart', endpoint: server.endpoint });

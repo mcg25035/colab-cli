@@ -18,43 +18,83 @@ import {
   removeStoredServer,
 } from './storage.js';
 
+/**
+ * RuntimeManager owns all runtimes belonging to a single account. Operations
+ * are scoped to `accountId`: `list()` hits the global Colab API (single
+ * account view from the bound ColabClient) but local storage reads/writes
+ * only ever touch this account's servers.json.
+ */
 export class RuntimeManager {
-  constructor(private readonly colabClient: ColabClient) {}
+  constructor(
+    private readonly colabClient: ColabClient,
+    private readonly accountId: string,
+  ) {
+    if (!accountId) throw new Error('RuntimeManager requires accountId');
+  }
+
+  getAccountId(): string {
+    return this.accountId;
+  }
 
   async resolveTarget(endpoint?: string): Promise<StoredServer> {
+    // Phase 1.13 FIX7: brief retry loop. Even with fsync (writeServersFileSync),
+    // there is still a small risk that the user (or a cluster scheduler script)
+    // spawns a brand-new CLI process between the parent process exiting and the
+    // filesystem metadata fully propagating to readers. We retry 3 times with
+    // 500ms back-off (~1.5s total worst case); enough for any kernel page cache
+    // to be visible cross-process without making a slow-runtime CLI appear to
+    // hang. The previous "No local record for endpoint" wording at T11 keepalive
+    // v3 race-condition user report was triggered by 5 parallel `runtime create`
+    // → immediate `exec -e`, which is exactly this window.
+    //
+    // Path semantics (unchanged from MurphyLo baseline):
+    //   - `endpoint` given: pure local lookup. User explicitly scoped; CLI
+    //     must NOT ping backend or autonomously delete the entry on transient
+    //     backend hiccups. Reverted from a prior FIX7 draft that added
+    //     `assertServerLive` here — that was scope creep; this path stays
+    //     pure-local.
+    //   - no `endpoint`: fall back to "latest server" and ping backend to
+    //     detect / clean up a local entry whose runtime Colab backend has
+    //     reaped (idle timeout, Free tier quota churn). This stale-cleanup
+    //     behavior is pre-existing MurphyLo baseline, not new in FIX7.
     if (endpoint) {
-      const server = this.getServerByEndpoint(endpoint);
-      if (!server) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const server = this.getServerByEndpoint(endpoint);
+        if (server) return server;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 500));
+      }
+      throw new Error(
+        `No local record for endpoint ${endpoint}. ` +
+        `If you just created this runtime, wait 1-2s and retry — the servers.json write may still be flushing. ` +
+        `Otherwise run \`colab runtime list\` to see active runtimes.`,
+      );
+    }
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const server = this.getLatestServer();
+      if (server) {
+        const assignments = await this.list();
+        if (assignments.some((a) => a.endpoint === server.endpoint)) {
+          return server;
+        }
+
+        await stopDaemon(this.accountId, server.id);
+        removeStoredServer(this.accountId, server.id);
+
+        const active = assignments.map((a) => a.endpoint);
+        if (active.length === 0) {
+          throw new Error(
+            `Runtime ${server.endpoint} is no longer active (stale local record removed). No active runtimes — create one with \`colab runtime create\`.`,
+          );
+        }
         throw new Error(
-          `No local record for endpoint ${endpoint}. Run \`colab runtime list\` to see active runtimes.`,
+          `Runtime ${server.endpoint} is no longer active (stale local record removed). Active runtimes: ${active.join(', ')}. Use --endpoint to specify.`,
         );
       }
-      return server;
-    }
-
-    const server = this.getLatestServer();
-    if (!server) {
-      throw new Error(
-        'No runtime found. Create one first with `colab runtime create`.',
-      );
-    }
-
-    const assignments = await this.list();
-    if (assignments.some((a) => a.endpoint === server.endpoint)) {
-      return server;
-    }
-
-    await stopDaemon(server.id);
-    removeStoredServer(server.id);
-
-    const active = assignments.map((a) => a.endpoint);
-    if (active.length === 0) {
-      throw new Error(
-        `Runtime ${server.endpoint} is no longer active (stale local record removed). No active runtimes — create one with \`colab runtime create\`.`,
-      );
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 500));
     }
     throw new Error(
-      `Runtime ${server.endpoint} is no longer active (stale local record removed). Active runtimes: ${active.join(', ')}. Use --endpoint to specify.`,
+      'No runtime found. Create one first with `colab runtime create`.',
     );
   }
 
@@ -85,6 +125,7 @@ export class RuntimeManager {
     const assignedVariant = (assignment.variant ?? Variant.DEFAULT) as Variant;
     const server: StoredServer = {
       id,
+      accountId: this.accountId,
       label: `Colab ${variantToMachineType(assignedVariant)}${
         assignment.accelerator !== 'NONE' ? ` ${assignment.accelerator}` : ''
       }`,
@@ -99,12 +140,12 @@ export class RuntimeManager {
     };
 
     storeServer(server);
-    await startDaemon(server.id);
+    await startDaemon(this.accountId, server.id);
     return server;
   }
 
   async destroy(endpoint: string): Promise<void> {
-    const servers = listStoredServers();
+    const servers = listStoredServers(this.accountId);
     const server = servers.find((s) => s.endpoint === endpoint);
 
     try {
@@ -117,8 +158,8 @@ export class RuntimeManager {
     }
 
     if (server) {
-      await stopDaemon(server.id);
-      removeStoredServer(server.id);
+      await stopDaemon(this.accountId, server.id);
+      removeStoredServer(this.accountId, server.id);
     }
   }
 
@@ -127,7 +168,7 @@ export class RuntimeManager {
   }
 
   getLatestServer(): StoredServer | undefined {
-    const servers = listStoredServers();
+    const servers = listStoredServers(this.accountId);
     if (servers.length === 0) return undefined;
     return servers.sort(
       (a, b) => b.dateAssigned.getTime() - a.dateAssigned.getTime(),
@@ -135,7 +176,7 @@ export class RuntimeManager {
   }
 
   getServerByEndpoint(endpoint: string): StoredServer | undefined {
-    return listStoredServers().find((s) => s.endpoint === endpoint);
+    return listStoredServers(this.accountId).find((s) => s.endpoint === endpoint);
   }
 
   private async resolveAccelerator(

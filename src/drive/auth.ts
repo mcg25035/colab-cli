@@ -2,8 +2,8 @@ import fs from 'fs';
 import { OAuth2Client } from 'google-auth-library';
 import { GaxiosError } from 'gaxios';
 import {
-  CONFIG_DIR,
-  DRIVE_AUTH_FILE,
+  accountDir,
+  accountDriveAuthFile,
   DRIVE_CLIENT_ID,
   DRIVE_CLIENT_SECRET,
   DRIVE_SCOPES,
@@ -23,9 +23,21 @@ interface DriveSession {
 export class DriveAuthManager {
   private oAuth2Client: OAuth2Client;
   private accessToken?: string;
+  // Phase 1 FIX4: accountId is mutable. Constructor accepts a placeholder
+  // ('__pending__') for the bootstrap path (drive login with no colab account
+  // registered yet); `ensureAuthorized()` overwrites it with the real email
+  // discovered from OAuth userinfo before any file I/O so the per-account
+  // directory & file land on the true Drive owner's path.
+  private accountId: string;
 
-  constructor() {
+  constructor(accountId: string) {
+    if (!accountId) throw new Error('DriveAuthManager requires accountId');
+    this.accountId = accountId;
     this.oAuth2Client = new OAuth2Client(DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET);
+  }
+
+  getAccountId(): string {
+    return this.accountId;
   }
 
   async ensureAuthorized(): Promise<void> {
@@ -76,9 +88,23 @@ export class DriveAuthManager {
 
     this.accessToken = accessToken;
     const email = await this.fetchEmail(accessToken);
+    // Adopt the userinfo email as the authoritative accountId. This makes
+    // `colab drive login` work even before any colab account is registered
+    // (bootstrap path), and also catches accidental cross-account OAuth
+    // (user runs `--account A@gmail.com` but signs in as B in browser): we
+    // honor the real Drive owner rather than the (wrong) hint, storing at
+    // the canonical `accounts/<real-email>/drive-auth.json` path.
+    if (email && email !== this.accountId) {
+      if (this.accountId !== '__pending__') {
+        log.warn(
+          `Drive login: hint account ${this.accountId} does not match OAuth userinfo email ${email}; ` +
+          `using ${email} as the canonical account.`,
+        );
+      }
+      this.accountId = email;
+    }
     this.storeCredentials({ refreshToken, clientId: DRIVE_CLIENT_ID, email });
   }
-
   async getAccessToken(): Promise<string> {
     if (!this.accessToken) {
       await this.ensureAuthorized();
@@ -120,10 +146,11 @@ export class DriveAuthManager {
 
   private loadStored(): DriveSession | undefined {
     try {
-      if (!fs.existsSync(DRIVE_AUTH_FILE)) return undefined;
-      const data = JSON.parse(fs.readFileSync(DRIVE_AUTH_FILE, 'utf-8'));
+      const file = accountDriveAuthFile(this.accountId);
+      if (!fs.existsSync(file)) return undefined;
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
       if (typeof data.refreshToken === 'string') {
-        return { refreshToken: data.refreshToken, clientId: data.clientId ?? '' };
+        return { refreshToken: data.refreshToken, clientId: data.clientId ?? '', email: data.email };
       }
       return undefined;
     } catch {
@@ -132,8 +159,8 @@ export class DriveAuthManager {
   }
 
   private storeCredentials(session: DriveSession): void {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(DRIVE_AUTH_FILE, JSON.stringify(session, null, 2), { mode: 0o600 });
+    fs.mkdirSync(accountDir(this.accountId), { recursive: true });
+    fs.writeFileSync(accountDriveAuthFile(this.accountId), JSON.stringify(session, null, 2), { mode: 0o600 });
   }
 
   private async fetchEmail(token: string): Promise<string | undefined> {
@@ -150,7 +177,7 @@ export class DriveAuthManager {
   }
 
   private removeStored(): void {
-    try { fs.unlinkSync(DRIVE_AUTH_FILE); } catch { /* ignore */ }
+    try { fs.unlinkSync(accountDriveAuthFile(this.accountId)); } catch { /* ignore */ }
   }
 }
 

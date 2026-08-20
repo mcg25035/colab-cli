@@ -2,8 +2,14 @@ import { AuthManager } from '../auth/auth-manager.js';
 import { startBackgroundAuth } from '../auth/background-auth.js';
 import { createSpinner, isJsonMode, jsonResult, notifyAuthUrl } from '../output/json-output.js';
 
-export async function loginCommand(authManager: AuthManager): Promise<void> {
-  if (authManager.isLoggedIn()) {
+export async function loginCommand(
+  authManager: AuthManager,
+  opts: { account?: string } = {},
+): Promise<void> {
+  // If a specific account was requested and the manager is already logged in,
+  // we still force re-login flow (refresh may have failed; user passed
+  // --account to re-auth explicitly). Be idempotent for the no-arg case only.
+  if (authManager.isLoggedIn() && !opts.account) {
     const account = authManager.getAccount();
     if (isJsonMode()) {
       jsonResult({ command: 'auth.login', alreadyLoggedIn: true, name: account?.label, email: account?.id });

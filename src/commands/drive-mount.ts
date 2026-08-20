@@ -1,113 +1,100 @@
-import { MountAuthManager } from '../drive/mount-auth.js';
-import { mountDrive } from '../drive/mount.js';
+import { handleEphemeralAuth } from '../auth/ephemeral.js';
 import { DaemonClient } from '../daemon/client.js';
+import { ColabClient } from '../colab/client.js';
 import { RuntimeManager } from '../runtime/runtime-manager.js';
-import { startBackgroundAuth } from '../auth/background-auth.js';
-import { createSpinner, isJsonMode, jsonError, jsonResult } from '../output/json-output.js';
+import { renderStream } from '../output/terminal-renderer.js';
+import { createSpinner, isJsonMode, setJsonMode } from '../output/json-output.js';
 
-export async function driveMountLoginCommand(): Promise<void> {
-  const mountAuth = new MountAuthManager();
+const MOUNT_PATH = '/content/drive';
+const MOUNT_CODE = `from google.colab import drive
+drive.mount('${MOUNT_PATH}')`;
 
-  if (isJsonMode()) {
-    if (mountAuth.isAuthorized()) {
-      jsonResult({ command: 'drive-mount.login', alreadyLoggedIn: true, email: mountAuth.getEmail() ?? null });
-    } else {
-      await startBackgroundAuth('drive-mount');
-    }
-    return;
-  }
-
-  await mountAuth.ensureAuthorized();
-  const email = mountAuth.getEmail();
-  console.log(`Drive mount authorized${email ? ` as ${email}` : ''}.`);
-  console.log('Future runtimes can now mount Drive automatically with `colab drive-mount`.');
-}
-
+/**
+ * `colab drive-mount -e <endpoint> [--account <email>]`
+ *
+ * Phase 1 FIX4 rewrote this command to use Colab backend's ephemeral
+ * credentials-propagation flow, matching the official colab-cli's
+ * `drivemount` semantics.
+ *
+ * Cross-account enforcement: resolveTarget only looks at the active
+ * account's `servers.json` (RuntimeManager built per-account in
+ * src/index.ts). An endpoint owned by account B does NOT appear in
+ * account A's server table, so `colab drive-mount -e <B's endpoint>
+ * --account A` throws here. Backend additionally pins login_hint
+ * to the runtime owner's email, so even a hypothetical local lookup
+ * miss cannot mount another account's Drive.
+ *
+ * `handleEphemeralAuth` (src/auth/ephemeral.ts) does the three-step
+ * credentials-propagation dance against
+ * `/tun/m/credentials-propagation/<endpoint>?authType=dfs_ephemeral`:
+ *   1. dry-run probe;
+ *   2. if backend says success → propagate;
+ *   3. if backend returns unauthorized_redirect_uri → print + open the
+ *      URL, wait for the human to consent in browser, then propagate.
+ * MurphyLo's previous local-DriveFS-binary design (mount.ts +
+ * mount-auth.ts, DRIVEFS_CLIENT_ID env var) was deleted in favor of this.
+ *
+ * `--json` is not compatible with the streaming kernel output this
+ * command produces (we mirror `colab exec`'s stance): we warn and force
+ * plain mode so the kernel's stdout/stderr render normally.
+ */
 export async function driveMountCommand(
   runtimeManager: RuntimeManager,
-  endpoint?: string,
+  colabClient: ColabClient,
+  options: {
+    endpoint?: string;
+  },
 ): Promise<void> {
-  const mountAuth = new MountAuthManager();
-  if (!mountAuth.isAuthorized()) {
-    if (isJsonMode()) {
-      jsonError('Drive mount not authorized. Run `colab drive-mount login` first.');
-    } else {
-      console.error('Drive mount not authorized. Run `colab drive-mount login` first.');
-    }
-    process.exit(1);
+  if (isJsonMode()) {
+    console.error('Warning: --json is not supported for `drive-mount` and will be ignored.');
+    setJsonMode(false);
   }
 
-  const server = await runtimeManager.resolveTarget(endpoint);
+  // Cross-account enforcement: lookup in active account's servers.json only.
+  const server = await runtimeManager.resolveTarget(options.endpoint);
 
   const spinner = createSpinner('Connecting to daemon...').start();
   const client = new DaemonClient();
   try {
-    await client.connect(server.id);
-    spinner.text = 'Mounting Google Drive...';
-    await mountDrive(client, mountAuth);
-    if (isJsonMode()) {
-      spinner.stop();
-      jsonResult({ command: 'drive-mount', endpoint: server.endpoint, mountPath: '/content/drive' });
-    } else {
-      spinner.succeed('Google Drive mounted at /content/drive');
-    }
+    await client.connect(server.accountId!, server.id);
+    spinner.text = 'Mounting Google Drive via ephemeral auth flow...';
   } catch (err) {
-    spinner.fail('Drive mount failed');
+    spinner.fail('Failed to connect to daemon');
     throw err;
+  }
+
+  // Override SIGINT: first Ctrl+C interrupts kernel, second force-exits.
+  const origSigint = process.rawListeners('SIGINT').slice();
+  process.removeAllListeners('SIGINT');
+  let interrupted = false;
+  const doInterrupt = () => {
+    if (interrupted) process.exit(1);
+    interrupted = true;
+    client.interrupt();
+  };
+  process.on('SIGINT', doInterrupt);
+
+  let hasError = false;
+  try {
+    const outputs = client.exec(MOUNT_CODE, {
+      handleEphemeralAuth: async (authType) => {
+        await handleEphemeralAuth(colabClient, server.endpoint, authType, server.label);
+      },
+    });
+    hasError = await renderStream(outputs);
   } finally {
+    process.removeAllListeners('SIGINT');
+    for (const fn of origSigint) {
+      process.on('SIGINT', fn as (...args: any[]) => void);
+    }
     client.close();
   }
-}
 
-export async function driveMountLogoutCommand(): Promise<void> {
-  if (!MountAuthManager.isConfigured()) {
-    if (isJsonMode()) {
-      jsonResult({ command: 'drive-mount.logout', configured: false, wasLoggedIn: false });
-    } else {
-      console.log('Drive mount not configured.');
-    }
+  if (hasError) {
+    spinner.fail('Drive mount failed');
+    process.exitCode = 1;
     return;
   }
 
-  const mountAuth = new MountAuthManager();
-  if (!mountAuth.isAuthorized()) {
-    if (isJsonMode()) {
-      jsonResult({ command: 'drive-mount.logout', configured: true, wasLoggedIn: false });
-    } else {
-      console.log('Not authorized.');
-    }
-    return;
-  }
-  const email = mountAuth.getEmail();
-  await mountAuth.logout();
-  if (isJsonMode()) {
-    jsonResult({ command: 'drive-mount.logout', configured: true, wasLoggedIn: true, email: email ?? null });
-  } else {
-    console.log(`Drive mount authorization removed${email ? ` (${email})` : ''}.`);
-  }
-}
-
-export async function driveMountStatusCommand(): Promise<void> {
-  if (!MountAuthManager.isConfigured()) {
-    if (isJsonMode()) {
-      jsonResult({ command: 'drive-mount.status', configured: false, authorized: false });
-    } else {
-      console.error('Drive mount not configured.');
-      console.error('Set COLAB_DRIVEFS_CLIENT_ID and COLAB_DRIVEFS_CLIENT_SECRET environment variables.');
-    }
-    return;
-  }
-
-  const mountAuth = new MountAuthManager();
-  const authorized = mountAuth.isAuthorized();
-  const email = authorized ? mountAuth.getEmail() : undefined;
-  if (isJsonMode()) {
-    jsonResult({ command: 'drive-mount.status', configured: true, authorized, email: email ?? null });
-  } else if (authorized) {
-    console.log(`Drive mount authorized${email ? ` (${email})` : ''}.`);
-    console.log('Run `colab drive-mount` to mount Drive on the active runtime.');
-  } else {
-    console.log('Drive mount not yet authorized.');
-    console.log('Run `colab drive-mount login` to set up.');
-  }
+  spinner.succeed(`Google Drive mounted at ${MOUNT_PATH}`);
 }

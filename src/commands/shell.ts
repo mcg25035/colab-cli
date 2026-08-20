@@ -62,13 +62,16 @@ async function allocateShellId(): Promise<number> {
   throw new Error('Failed to allocate shell ID: lock timeout');
 }
 
-async function findShellDaemon(shellId: number): Promise<DaemonClient> {
-  const servers = listStoredServers();
+async function findShellDaemon(accountId: string, shellId: number): Promise<DaemonClient> {
+  // FIX5: scope lookup to the active account only — avoids crosstalk where
+  // two accounts each have a shell with the same numeric id and the wrong
+  // one is attached to.
+  const servers = listStoredServers(accountId);
   for (const server of servers) {
-    if (!(await isDaemonRunning(server.id))) continue;
+    if (!(await isDaemonRunning(server.accountId!, server.id))) continue;
     try {
       const client = new DaemonClient();
-      await client.connect(server.id);
+      await client.connect(server.accountId!, server.id);
       try {
         const shells = await client.shellList();
         if (shells.some(s => s.shellId === shellId)) {
@@ -90,40 +93,68 @@ export async function shellCommand(
   options: {
     endpoint?: string;
     background?: boolean;
+    /** Optional command to send to the shell after it's ready (with or without trailing newline). */
+    cmd?: string;
+    /** Reuse an existing background shell instead of opening a new one. */
+    shellId?: number;
   },
 ): Promise<void> {
   const server = await runtimeManager.resolveTarget(options.endpoint);
-  const shellId = await allocateShellId();
 
-  const spinner = createSpinner('Connecting to shell...').start();
-  const client = new DaemonClient();
-  try {
-    await client.connect(server.id);
-  } catch (err) {
-    spinner.fail('Failed to connect to daemon');
-    throw err;
+  let shellId: number;
+  let client: DaemonClient;
+  if (options.shellId !== undefined) {
+    // Reuse an existing shell. findShellDaemon throws if it doesn't exist.
+    shellId = options.shellId;
+    client = await findShellDaemon(runtimeManager.getAccountId(), shellId);
+  } else {
+    shellId = await allocateShellId();
+    client = new DaemonClient();
+    await client.connect(server.accountId!, server.id);
+
+    const spinner = createSpinner('Connecting to shell...').start();
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+    try {
+      await client.shellOpen(cols, rows, shellId);
+      spinner.stop();
+    } catch (err) {
+      spinner.fail('Failed to open shell');
+      throw err;
+    }
   }
 
-  const cols = process.stdout.columns || 80;
-  const rows = process.stdout.rows || 24;
-
-  try {
-    await client.shellOpen(cols, rows, shellId);
-    spinner.stop();
-  } catch (err) {
-    spinner.fail('Failed to open shell');
-    throw err;
+  // Send the optional command BEFORE either background-exit or foreground-attach,
+  // so the long-running task kicks off immediately; the user/agent can later
+  // `colab shell attach <id> --no-wait [--tail N]` to peek at progress without
+  // hanging the CLI on a stream.
+  if (options.cmd !== undefined) {
+    // `--cmd` uses the same `\n`/`\r`/`\t`/`\xNN` escape semantics as
+    // `shell send --data` so callers can embed Enter (`\n`) or control
+    // bytes (`\x03`) without quoting surprises (e.g. single-quoted bash
+    // args like `'foo\n'` arrive as literal backslash-n and need unescape).
+    const cmd = unescapeData(options.cmd);
+    try {
+      await client.shellSend(shellId, cmd);
+    } catch (err) {
+      client.close();
+      throw err;
+    }
   }
 
   if (options.background) {
-    // Background mode: print shell ID and exit
+    // Background mode: print shell ID and exit (client closes; shell + any
+    // running command keeps going on the relay).
     console.log(shellId);
     client.close();
     return;
   }
 
-  // Foreground mode: attach and enter interactive session
+  // Foreground mode: attach and enter interactive session.
+  // (`--shell <id>` reuse + foreground attach = same as `shell attach <id>`.)
   try {
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
     const buffered = await client.shellAttach(shellId, cols, rows);
     if (buffered) {
       process.stdout.write(buffered);
@@ -136,13 +167,14 @@ export async function shellCommand(
 }
 
 export async function shellAttachCommand(
+  accountId: string,
   shellId: number,
   options: {
     noWait?: boolean;
     tail?: number;
   },
 ): Promise<void> {
-  const client = await findShellDaemon(shellId);
+  const client = await findShellDaemon(accountId, shellId);
 
   const noWait = options.noWait || options.tail !== undefined;
 
@@ -176,8 +208,17 @@ export async function shellAttachCommand(
   }
 }
 
-export async function shellListCommand(): Promise<void> {
-  const servers = listStoredServers();
+/**
+ * FIX5 (Phase 1.13): `shell list` is a user-facing command and must only
+ * enumerate shells on runtimes owned by the active account (or the one
+ * targeted by `--account`). Using `listAllStoredServers` here was a Phase 1
+ * plumbing regression that also surfaced shells from other accounts'
+ * daemons — visible crosstalk. The cluster scheduler may eventually want a
+ * cross-account view via a separate path (e.g. `cluster shell list`), but
+ * `colab shell list` must stay per-account.
+ */
+export async function shellListCommand(accountId: string): Promise<void> {
+  const servers = listStoredServers(accountId);
   const allShells: Array<{
     shellId: number;
     endpoint: string;
@@ -187,10 +228,10 @@ export async function shellListCommand(): Promise<void> {
   }> = [];
 
   for (const server of servers) {
-    if (!(await isDaemonRunning(server.id))) continue;
+    if (!(await isDaemonRunning(server.accountId!, server.id))) continue;
     try {
       const client = new DaemonClient();
-      await client.connect(server.id);
+      await client.connect(server.accountId!, server.id);
       try {
         const shells = await client.shellList();
         for (const s of shells) {
@@ -232,6 +273,7 @@ function readStdin(): Promise<string> {
 }
 
 export async function shellSendCommand(
+  accountId: string,
   shellId: number,
   options: {
     data?: string;
@@ -261,7 +303,7 @@ export async function shellSendCommand(
     process.exit(1);
   }
 
-  const client = await findShellDaemon(shellId);
+  const client = await findShellDaemon(accountId, shellId);
 
   try {
     await client.shellSend(shellId, data);

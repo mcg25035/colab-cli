@@ -1,13 +1,27 @@
 #!/usr/bin/env -S node --use-env-proxy --disable-warning=UNDICI-EHPA
 
 import { Command, Option } from 'commander';
-import { COLAB_API_DOMAIN, COLAB_GAPI_DOMAIN, OAUTH_CLIENT_ID, DRIVEFS_CLIENT_ID } from './config.js';
+import fs from 'fs';
+import path from 'path';
+import { COLAB_API_DOMAIN, COLAB_GAPI_DOMAIN, OAUTH_CLIENT_ID, LEGACY_DRIVE_AUTH_FILE, accountDriveAuthFile } from './config.js';
 import { AuthManager } from './auth/auth-manager.js';
 import { ColabClient } from './colab/client.js';
 import { RuntimeManager } from './runtime/runtime-manager.js';
 import { log } from './logging/index.js';
 import { setJsonMode, jsonError, jsonResult, isJsonMode } from './output/json-output.js';
 import { AuthConsentError } from './auth/ephemeral.js';
+import {
+  migrateLegacyAccountIfNeeded,
+  listRegistryAccounts,
+  getActiveAccountEmail,
+  setActiveAccountEmail,
+  unregisterAccount,
+  pickSuccessorAccountEmail,
+  registerAccount,
+  RegistryAccount,
+} from './auth/accounts-registry.js';
+import { removeStoredSession } from './auth/storage.js';
+import { migrateLegacyServersIfNeeded } from './runtime/storage.js';
 import { loginCommand, statusCommand, logoutCommand } from './commands/auth.js';
 import {
   createRuntimeCommand,
@@ -54,13 +68,7 @@ import {
   driveMoveCommand,
 } from './commands/drive.js';
 import { DriveAuthManager } from './drive/auth.js';
-import { MountAuthManager } from './drive/mount-auth.js';
-import {
-  driveMountLoginCommand,
-  driveMountLogoutCommand,
-  driveMountCommand,
-  driveMountStatusCommand,
-} from './commands/drive-mount.js';
+import { driveMountCommand } from './commands/drive-mount.js';
 
 const program = new Command();
 
@@ -71,6 +79,7 @@ program
   .allowExcessArguments(false)
   .option('--verbose', 'enable verbose logging')
   .option('--json', 'output results as JSON to stdout (for scripting)')
+  .option('--account <email>', 'operate on this account instead of the registry active account')
   .configureHelp({
     subcommandTerm: (cmd) => {
       const args = (cmd as any).registeredArguments
@@ -87,15 +96,26 @@ program
     if (opts.json) {
       setJsonMode(true);
     }
+    if (opts.account) {
+      cliAccountOverride = opts.account;
+    }
   });
 
-// Shared state
-let authManager: AuthManager;
-let colabClient: ColabClient;
-let runtimeManager: RuntimeManager;
+// Per-account shared state. CLI builds one (AuthManager, ColabClient,
+// RuntimeManager) triple per active account and caches it for the process
+// lifetime. The registry's `active` pointer picks the default account; the
+// `--account` global flag can override on any command.
+const accountCache = new Map<string, { auth: AuthManager; client: ColabClient; runtime: RuntimeManager }>();
+let activeAccountId: string | undefined;
+let cliAccountOverride: string | undefined; // from --account
+
+function resolveActiveAccountId(): string | undefined {
+  return cliAccountOverride ?? activeAccountId ?? getActiveAccountEmail();
+}
 
 async function ensureInitialized(): Promise<void> {
-  if (authManager) return;
+  if (activeAccountId && !cliAccountOverride) return;
+  if (cliAccountOverride && accountCache.has(cliAccountOverride)) return;
 
   if (!OAUTH_CLIENT_ID) {
     console.error(
@@ -104,26 +124,143 @@ async function ensureInitialized(): Promise<void> {
     process.exit(1);
   }
 
-  authManager = new AuthManager();
-  await authManager.initialize();
+  // On first CLI invocation, adopt any legacy single-account creds.
+  migrateLegacyAccountIfNeeded();
 
-  colabClient = new ColabClient(
+  const accountId = resolveActiveAccountId();
+  if (!accountId) {
+    // No accounts registered and no legacy creds to migrate — many commands
+    // remain usable (e.g. `auth login`), but `ensureLoggedIn` will reject
+    // them. Keep activeAccountId undefined so callers see "not logged in".
+    return;
+  }
+  activeAccountId = accountId;
+
+  // Migrate legacy servers.json into this account's tree if needed — must run
+  // before any runtime command reads/writes servers.json.
+  migrateLegacyServersIfNeeded(accountId);
+
+  // Migrate legacy global drive-auth.json into the per-account path if the
+  // email recorded in it is registered to colab. Drive-only users (email
+  // not in registry) keep the legacy file (legacy behaviour preserved).
+  migrateLegacyDriveAuth();
+
+  await buildManagersForAccount(accountId);
+}
+
+/**
+ * Phase 1 FIX4: lazily adopt MurphyLo's global `~/.config/colab-cli/drive-auth.json`
+ * into `accounts/<email>/drive-auth.json` when possible.
+ *
+ * Migration rule:
+ *   - Missing/corrupt legacy file: leave alone (nothering to do).
+ *   - Legacy file email NOT registered to colab: leave alone. Those are
+ *     drive-only users who haven't done `colab auth login`; creating a
+ *     per-account dir for them would orphan their accountDir from the
+ *     registry's active-pointer mechanism. Subsequent drive commands will
+ *     still read the legacy file via DriveAuthManager's legacy fallback.
+ *   - Legacy file email IS registered to colab AND per-account file
+ *     already exists: per-account copy wins; just delete the stale legacy.
+ *   - Legacy file email IS registered to colab AND per-account file
+ *     doesn't exist: copy legacy → per-account, delete legacy, log success.
+ *
+ * Idempotent. Safe to call from every CLI invocation.
+ */
+function migrateLegacyDriveAuth(): void {
+  if (!fs.existsSync(LEGACY_DRIVE_AUTH_FILE)) return;
+
+  let data: unknown;
+  try {
+    data = JSON.parse(fs.readFileSync(LEGACY_DRIVE_AUTH_FILE, 'utf-8'));
+  } catch (err) {
+    log.warn(`Legacy drive-auth.json unreadable; leaving untouched: ${err}`);
+    return;
+  }
+
+  const obj = data as { refreshToken?: unknown; email?: unknown };
+  if (typeof obj.refreshToken !== 'string') {
+    log.warn('Legacy drive-auth.json missing refreshToken; leaving untouched.');
+    return;
+  }
+  const email = typeof obj.email === 'string' ? obj.email : undefined;
+  if (!email) {
+    // Can't migrate without an email anchor. Leave alone; the next
+    // `colab drive login` will return the real email via userinfo and
+    // store at the per-account path, then a future run of this fn (or
+    // its legacy fallback in DriveAuthManager) will clean up the legacy.
+    return;
+  }
+
+  // Only migrate when the email is already a registered colab account.
+  // Otherwise this is a drive-only user — legacy behaviour preserved.
+  const registeredEmails = listRegistryAccounts().map((a) => a.email);
+  if (!registeredEmails.includes(email)) {
+    return;
+  }
+
+  const dest = accountDriveAuthFile(email);
+  if (fs.existsSync(dest)) {
+    // Per-account creds win — just remove stale legacy.
+    try {
+      fs.unlinkSync(LEGACY_DRIVE_AUTH_FILE);
+      log.info(`Removed stale legacy drive-auth.json (per-account copy at ${dest}).`);
+    } catch (err) {
+      log.warn(`Could not remove stale legacy drive-auth.json: ${err}`);
+    }
+    return;
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.unlinkSync(LEGACY_DRIVE_AUTH_FILE);
+    log.info(`Migrated global drive-auth.json → ${dest}.`);
+  } catch (err) {
+    log.warn(`Failed to migrate legacy drive-auth.json: ${err}`);
+  }
+}
+
+async function buildManagersForAccount(accountId: string): Promise<void> {
+  if (accountCache.has(accountId)) return;
+  const auth = new AuthManager(accountId);
+  await auth.initialize();
+  const client = new ColabClient(
     new URL(COLAB_API_DOMAIN),
     new URL(COLAB_GAPI_DOMAIN),
-    () => authManager.getAccessToken(),
-    () => authManager.logout(),
+    () => auth.getAccessToken(),
+    () => auth.logout(),
   );
+  const runtime = new RuntimeManager(client, accountId);
+  accountCache.set(accountId, { auth, client, runtime });
+}
 
-  runtimeManager = new RuntimeManager(colabClient);
+function getActive(): { auth: AuthManager; client: ColabClient; runtime: RuntimeManager } {
+  if (!activeAccountId) {
+    throw new Error('No active account. Run `colab auth login` first.');
+  }
+  const entry = accountCache.get(activeAccountId);
+  if (!entry) {
+    throw new Error(`Account ${activeAccountId} not initialized.`);
+  }
+  return entry;
 }
 
 async function ensureLoggedIn(): Promise<void> {
   await ensureInitialized();
-  if (!authManager.isLoggedIn()) {
+  if (!activeAccountId) {
     if (isJsonMode()) {
       jsonError('Not logged in. Run `colab auth login` first.');
     } else {
       console.error('Not logged in. Run `colab auth login` first.');
+    }
+    process.exit(1);
+  }
+  const { auth } = getActive();
+  if (!auth.isLoggedIn()) {
+    if (isJsonMode()) {
+      jsonError(`Account ${activeAccountId} credentials missing or expired. Run \`colab auth login --account ${activeAccountId}\` to re-auth.`);
+    } else {
+      console.error(`Account ${activeAccountId} credentials missing or expired. Run \`colab auth login --account ${activeAccountId}\` to re-auth.`);
     }
     process.exit(1);
   }
@@ -134,26 +271,153 @@ const auth = program.command('auth').description('manage authentication');
 
 auth
   .command('login')
-  .description('sign in with Google OAuth')
-  .action(async () => {
+  .description('sign in with Google OAuth; adds the account to the registry and marks it active')
+  .option('--account <email>', 're-auth a specific existing account by email')
+  .action(async (opts) => {
+    // Bootstrap path: login is the entry point for a fresh env (no accounts
+    // yet), so it MUST NOT depend on an existing active account. The original
+    // `getActive().auth` design throws in fresh env — this is the Phase 1 bug
+    // caught by T4 testing. We instead build a throwaway AuthManager with a
+    // placeholder accountId; AuthManager.login() fetches the real email from
+    // userinfo and overwrites accountId from the response.
     await ensureInitialized();
-    await loginCommand(authManager);
+
+    let auth: AuthManager;
+    if (opts.account) {
+      // Re-auth path: target account specified. Must already be registered.
+      const exists = listRegistryAccounts().some((a) => a.email === opts.account);
+      if (!exists) {
+        console.error(
+          `Account ${opts.account} is not registered.\n` +
+          `If this is a brand-new Google account, omit --account and run \`colab auth login\` first.`,
+        );
+        process.exit(1);
+      }
+      // Build/cache a manager for this specific account.
+      await buildManagersForAccount(opts.account);
+      auth = accountCache.get(opts.account)!.auth;
+    } else {
+      // Fresh-login path: no active account required. Use placeholder
+      // `__pending__` as the AuthManager's initial accountId; login() will
+      // overwrite it with the real email after the OAuth userinfo roundtrip.
+      auth = new AuthManager('__pending__');
+    }
+
+    await loginCommand(auth, { account: opts.account });
+
+    // After login, AuthManager.login() has side effects:
+    //   - stored session to accounts/<email>/auth.json
+    //   - registerAccount() added it to registry
+    //   - setActiveAccountEmail() pointed `active` at it
+    //   - AuthManager.accountId updated from `__pending__` to real email
+    // Make our process-local cache reflect this so the next CLI invocation in
+    // the same process sees the new active account.
+    const newActiveEmail = getActiveAccountEmail();
+    if (newActiveEmail && newActiveEmail !== activeAccountId) {
+      activeAccountId = newActiveEmail;
+      // Build the proper cache entry (read back the now-stored session).
+      await buildManagersForAccount(newActiveEmail);
+    }
   });
 
 auth
   .command('status')
-  .description('show authentication status')
+  .description('show authentication status of the active account')
   .action(async () => {
     await ensureInitialized();
-    await statusCommand(authManager);
+    if (!activeAccountId) {
+      // No accounts at all → friendly message, mirroring `ensureLoggedIn`
+      // behaviour rather than throwing a raw `getActive()` Error.
+      if (isJsonMode()) {
+        jsonResult({ command: 'auth.status', loggedIn: false });
+      } else {
+        console.log('Not logged in. Run `colab auth login` to sign in.');
+      }
+      return;
+    }
+    const { auth } = getActive();
+    await statusCommand(auth);
   });
 
 auth
   .command('logout')
-  .description('sign out and revoke tokens')
-  .action(async () => {
+  .description('sign out and revoke tokens for the active account (or a specific one)')
+  .option('-a, --account <email>', 'logout a specific account by email')
+  .action(async (opts) => {
     await ensureInitialized();
-    await logoutCommand(authManager);
+    const target = opts.account ?? activeAccountId;
+    if (!target) return;
+    // Use the cached manager for this account if present; else build a fresh throwaway one.
+    let auth: AuthManager;
+    if (accountCache.has(target)) {
+      auth = accountCache.get(target)!.auth;
+    } else {
+      const m = new AuthManager(target);
+      await m.initialize();
+      auth = m;
+    }
+    await auth.logout();
+    accountCache.delete(target);
+    if (activeAccountId === target) {
+      const succ = pickSuccessorAccountEmail(target);
+      activeAccountId = succ;
+      if (succ) await buildManagersForAccount(succ);
+    }
+  });
+
+auth
+  .command('list')
+  .description('list all registered accounts; mark the active one')
+  .action(async () => {
+    // Adopt legacy single-account creds if present so the list reflects them.
+    migrateLegacyAccountIfNeeded();
+    // Adopt legacy servers.json into the active account too, so a freshly
+    // migrated user doesn't see an empty `runtime list` until their next
+    // runtime command triggers it.
+    const active = getActiveAccountEmail();
+    if (active) {
+      migrateLegacyServersIfNeeded(active);
+    }
+    const accounts = listRegistryAccounts();
+    const activeEmail = getActiveAccountEmail();
+    if (isJsonMode()) {
+      jsonResult({ command: 'auth.list', accounts, active });
+      return;
+    }
+    if (accounts.length === 0) {
+      console.log('No accounts. Run `colab auth login` to add one.');
+      return;
+    }
+    console.log('\nAccounts:');
+    for (const a of accounts) {
+      const marker = a.email === activeEmail ? '*' : ' ';
+      console.log(`  ${marker} ${a.email}  (${a.name})`);
+    }
+    console.log('');
+  });
+
+auth
+  .command('switch <email>')
+  .description('set the active account by email')
+  .action(async (email: string) => {
+    // Just update the registry pointer. Initialization (and any necessary
+    // token refresh) happens lazily on the next command that actually needs
+    // an access token. A previously-registered account whose refresh token
+    // has expired should still appear switchable here — the user will get
+    // told to re-auth when they actually invoke a runtime command.
+    const accounts = listRegistryAccounts();
+    if (!accounts.some((a) => a.email === email)) {
+      console.error(`Account ${email} is not registered. Run \`colab auth list\` to see registered accounts.`);
+      process.exit(1);
+    }
+    setActiveAccountEmail(email);
+    activeAccountId = email;
+    const reg = accounts.find((a) => a.email === email);
+    if (isJsonMode()) {
+      jsonResult({ command: 'auth.switch', active: email, name: reg?.name });
+    } else {
+      console.log(`Switched active account to: ${email} (${reg?.name ?? ''})`);
+    }
   });
 
 // Runtime commands
@@ -183,7 +447,7 @@ runtime
   )
   .action(async (opts) => {
     await ensureLoggedIn();
-    await createRuntimeCommand(runtimeManager, opts);
+    await createRuntimeCommand(getActive().runtime, opts);
   });
 
 runtime
@@ -191,7 +455,7 @@ runtime
   .description('list available accelerators and machine shapes')
   .action(async () => {
     await ensureLoggedIn();
-    await listAvailableRuntimesCommand(colabClient);
+    await listAvailableRuntimesCommand(getActive().client);
   });
 
 runtime
@@ -199,7 +463,7 @@ runtime
   .description('list available runtime versions and their environment details')
   .action(async () => {
     await ensureLoggedIn();
-    await listRuntimeVersionsCommand(colabClient);
+    await listRuntimeVersionsCommand(getActive().client);
   });
 
 runtime
@@ -207,7 +471,7 @@ runtime
   .description('list active runtimes')
   .action(async () => {
     await ensureLoggedIn();
-    await listRuntimesCommand(runtimeManager);
+    await listRuntimesCommand(getActive().runtime);
   });
 
 runtime
@@ -216,7 +480,7 @@ runtime
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (opts) => {
     await ensureLoggedIn();
-    await destroyRuntimeCommand(runtimeManager, opts.endpoint);
+    await destroyRuntimeCommand(getActive().runtime, opts.endpoint);
   });
 
 runtime
@@ -225,7 +489,7 @@ runtime
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (opts) => {
     await ensureLoggedIn();
-    await restartRuntimeCommand(runtimeManager, opts.endpoint);
+    await restartRuntimeCommand(getActive().runtime, opts.endpoint);
   });
 
 runtime
@@ -234,7 +498,7 @@ runtime
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (opts) => {
     await ensureLoggedIn();
-    await resourcesCommand(runtimeManager, colabClient, opts.endpoint);
+    await resourcesCommand(getActive().runtime, getActive().client, opts.endpoint);
   });
 
 // Usage command
@@ -243,7 +507,7 @@ program
   .description('show subscription tier and compute-unit usage')
   .action(async () => {
     await ensureLoggedIn();
-    await usageCommand(colabClient);
+    await usageCommand(getActive().client);
   });
 
 // Exec command
@@ -257,14 +521,14 @@ const execCmd = program
   .action(async (code, opts) => {
     await ensureLoggedIn();
     if (opts.background) {
-      await execBgCommand(runtimeManager, {
+      await execBgCommand(getActive().runtime, {
         code,
         file: opts.file,
         endpoint: opts.endpoint,
         outputDir: opts.outputDir,
       });
     } else {
-      await execCommand(runtimeManager, colabClient, {
+      await execCommand(getActive().runtime, getActive().client, {
         code,
         file: opts.file,
         endpoint: opts.endpoint,
@@ -282,7 +546,7 @@ execCmd
   .action(async (id: string, opts) => {
     await ensureLoggedIn();
     const endpoint = opts.endpoint ?? execCmd.opts().endpoint;
-    await execAttachCommand(runtimeManager, colabClient, parseInt(id, 10), {
+    await execAttachCommand(getActive().runtime, getActive().client, parseInt(id, 10), {
       endpoint,
       noWait: !opts.wait,
       tail: opts.tail,
@@ -293,10 +557,11 @@ execCmd
   .command('list')
   .description('list executions with status')
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
+  .option('--json', 'output results as JSON to stdout (for scripting)')
   .action(async (opts) => {
     await ensureLoggedIn();
     const endpoint = opts.endpoint ?? execCmd.opts().endpoint;
-    await execListCommand(runtimeManager, {
+    await execListCommand(getActive().runtime, {
       endpoint,
     });
   });
@@ -310,7 +575,7 @@ execCmd
   .action(async (id: string, opts) => {
     await ensureLoggedIn();
     const endpoint = opts.endpoint ?? execCmd.opts().endpoint;
-    await execSendCommand(runtimeManager, parseInt(id, 10), {
+    await execSendCommand(getActive().runtime, parseInt(id, 10), {
       endpoint,
       stdin: opts.stdin,
       interrupt: opts.interrupt,
@@ -324,7 +589,7 @@ execCmd
   .action(async (id: string | undefined, opts) => {
     await ensureLoggedIn();
     const endpoint = opts.endpoint ?? execCmd.opts().endpoint;
-    await execClearCommand(runtimeManager, id ? parseInt(id, 10) : undefined, {
+    await execClearCommand(getActive().runtime, id ? parseInt(id, 10) : undefined, {
       endpoint,
     });
   });
@@ -335,22 +600,26 @@ const shellCmd = program
   .description('open an interactive terminal on a runtime (experimental)')
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .option('-b, --background', 'create shell in background, print shell ID and exit')
+  .option('-c, --cmd <cmd>', 'send a command to the shell after opening/attaching (no trailing newline added unless you include \\n)')
+  .option('-s, --shell <id>', 'reuse an existing background shell by ID instead of opening a new one', parseInt)
   .action(async (opts) => {
     await ensureLoggedIn();
-    await shellCommand(runtimeManager, {
+    await shellCommand(getActive().runtime, {
       endpoint: opts.endpoint,
       background: opts.background,
+      cmd: opts.cmd,
+      shellId: opts.shell,
     });
   });
 
 shellCmd
   .command('attach <id>')
-  .description('attach to a shell session (replay buffer + stream live output)')
+  .description('attach to a shell session for the active (or `--account`) account (replay buffer + stream live output)')
   .option('--no-wait', 'print buffered output and exit immediately')
   .option('--tail <n>', 'only last N lines of rendered output (implies --no-wait)', parseInt)
   .action(async (id: string, opts) => {
     await ensureLoggedIn();
-    await shellAttachCommand(parseInt(id, 10), {
+    await shellAttachCommand(getActive().runtime.getAccountId(), parseInt(id, 10), {
       noWait: !opts.wait,
       tail: opts.tail,
     });
@@ -358,10 +627,10 @@ shellCmd
 
 shellCmd
   .command('list')
-  .description('list active shell sessions')
+  .description('list active shell sessions for the active (or `--account`) account')
   .action(async () => {
     await ensureLoggedIn();
-    await shellListCommand();
+    await shellListCommand(getActive().runtime.getAccountId());
   });
 
 shellCmd
@@ -374,7 +643,7 @@ shellCmd
   )
   .action(async (id: string, opts) => {
     await ensureLoggedIn();
-    await shellSendCommand(parseInt(id, 10), {
+    await shellSendCommand(getActive().runtime.getAccountId(), parseInt(id, 10), {
       data: opts.data,
       signal: opts.signal,
     });
@@ -395,7 +664,7 @@ portForward
   .option('--tls', 'serve locally over HTTPS with a self-signed certificate')
   .action(async (spec: string, opts) => {
     await ensureLoggedIn();
-    await portForwardCreateCommand(runtimeManager, spec, { endpoint: opts.endpoint, tls: opts.tls });
+    await portForwardCreateCommand(getActive().runtime, spec, { endpoint: opts.endpoint, tls: opts.tls });
   });
 
 portForward
@@ -404,7 +673,7 @@ portForward
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (opts) => {
     await ensureLoggedIn();
-    await portForwardListCommand(runtimeManager, { endpoint: opts.endpoint });
+    await portForwardListCommand(getActive().runtime, { endpoint: opts.endpoint });
   });
 
 portForward
@@ -414,7 +683,7 @@ portForward
   .option('--all', 'close all port forwards')
   .action(async (id: string | undefined, opts) => {
     await ensureLoggedIn();
-    await portForwardCloseCommand(runtimeManager, id, {
+    await portForwardCloseCommand(getActive().runtime, id, {
       endpoint: opts.endpoint,
       all: opts.all,
     });
@@ -430,7 +699,7 @@ fsCmd
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (localPath, opts) => {
     await ensureLoggedIn();
-    await fsUploadCommand(runtimeManager, {
+    await fsUploadCommand(getActive().runtime, {
       localPath,
       remotePath: opts.remotePath,
       endpoint: opts.endpoint,
@@ -444,18 +713,47 @@ fsCmd
   .option('-e, --endpoint <endpoint>', 'runtime endpoint')
   .action(async (remotePath, opts) => {
     await ensureLoggedIn();
-    await fsDownloadCommand(runtimeManager, {
+    await fsDownloadCommand(getActive().runtime, {
       remotePath,
       localPath: opts.output,
       endpoint: opts.endpoint,
     });
   });
 
-// Drive commands (uses separate OAuth credentials — no Colab login required)
-let driveAuth: DriveAuthManager;
+// Drive commands use a separate OAuth client (rclone's public credentials)
+// but Phase 1 FIX4 stores their refresh token per-account under
+// `accounts/<email>/drive-auth.json` so multiple accounts no longer clobber
+// each other. Drive-only users (no colab login) keep a default
+// `__pending__` placeholder; the DriveAuthManager.login flow overwrites
+// the placeholder with the real email returned by Google userinfo and
+// then registers the account so future commands resolve to it.
+let driveAuth: DriveAuthManager | undefined;
+
+/**
+ * Phase 1 FIX4: resolve the accountId that drive commands should target.
+ *
+ * Precedence:
+ *   1. `--account <email>` global flag (cliAccountOverride)
+ *   2. Active colab account (activeAccountId set by ensureInitialized)
+ *   3. Email recorded inside legacy global drive-auth.json — supports
+ *      drive-only users upgrading from MurphyLo's single-account layout
+ *   4. `__pending__` placeholder — bootstrap path: DriveAuthManager.login
+ *      will replace it with the email from Google userinfo after OAuth.
+ */
+function resolveDriveAccountId(): string {
+  if (cliAccountOverride) return cliAccountOverride;
+  if (activeAccountId) return activeAccountId;
+  if (fs.existsSync(LEGACY_DRIVE_AUTH_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(LEGACY_DRIVE_AUTH_FILE, 'utf-8')) as { email?: unknown };
+      if (typeof data.email === 'string' && data.email) return data.email;
+    } catch { /* ignore */ }
+  }
+  return '__pending__';
+}
 
 function ensureDriveInit(): DriveAuthManager {
-  if (!driveAuth) driveAuth = new DriveAuthManager();
+  if (!driveAuth) driveAuth = new DriveAuthManager(resolveDriveAccountId());
   return driveAuth;
 }
 
@@ -478,7 +776,33 @@ drive
   .command('login')
   .description('authorize Google Drive access')
   .action(async () => {
-    await driveLoginCommand(ensureDriveInit());
+    // ensureInitialized() pre-warms the registry (legacy auth migration
+    // might have registered an account since the previous CLI invocation
+    // — we want our resolveDriveAccountId to pick that up). However,
+    // drive login itself is bootstrap-friendly: with no colab account
+    // and no legacy drive-auth.json (or an unexpected email there), the
+    // DriveAuthManager gets `__pending__` and mutates it to the real
+    // email after OAuth userinfo.
+    await ensureInitialized();
+    const da = ensureDriveInit();
+    await driveLoginCommand(da);
+
+    // After login, `da.accountId` is the real email (either pre-existing
+    // account or freshly discovered via Google userinfo). Register it
+    // into the colab registry if missing so future commands resolve to
+    // it via activeAccountId. Then drop a stale legacy drive-auth.json
+    // once its email maps to a registered colab account (FIX4 migration).
+    const realEmail = da.getAccountId();
+    if (realEmail && realEmail !== '__pending__') {
+      const alreadyRegistered = listRegistryAccounts().some((a) => a.email === realEmail);
+      if (!alreadyRegistered) {
+        registerAccount(realEmail, da.getEmail() ?? realEmail);
+      }
+      // Both register and re-ensure so setActiveAccountEmail succeeds.
+      setActiveAccountEmail(realEmail);
+      // Re-run legacy cleanup now that the email is registered.
+      migrateLegacyDriveAuth();
+    }
   });
 
 drive
@@ -578,38 +902,23 @@ drive
     await driveMoveCommand(da, itemId, opts.to);
   });
 
-// Drive mount commands (requires COLAB_DRIVEFS_CLIENT_ID/SECRET env vars)
-if (DRIVEFS_CLIENT_ID) {
-  const driveMount = program
-    .command('drive-mount')
-    .description('mount Google Drive on a runtime without browser auth')
-    .option('-e, --endpoint <endpoint>', 'runtime endpoint')
-    .action(async (opts) => {
-      await ensureLoggedIn();
-      await driveMountCommand(runtimeManager, opts.endpoint);
-    });
-
-  driveMount
-    .command('login')
-    .description('authorize for automatic Google Drive mounting')
-    .action(async () => {
-      await driveMountLoginCommand();
-    });
-
-  driveMount
-    .command('logout')
-    .description('remove stored Google Drive mount credentials')
-    .action(async () => {
-      await driveMountLogoutCommand();
-    });
-
-  driveMount
-    .command('status')
-    .description('show Google Drive mount authorization status')
-    .action(async () => {
-      await driveMountStatusCommand();
-    });
-}
+// drive-mount — Phase 1 FIX4: rewired to Colab backend's ephemeral
+// credentials-propagation flow. Requires a registered colab account
+// (active or via --account) so we can resolveTarget in THIS account's
+// servers.json (natural cross-account enforcement via lookup failure).
+// No separate "drive-mount login/logout/status" subcommands — there
+// are no persistent local mount creds anymore (the daemon gets creds
+// propagated by Colab backend each time the kernel calls
+// google.colab.drive.mount()).
+program
+  .command('drive-mount')
+  .description('mount the active account\'s Google Drive on a runtime via the ephemeral credentials-propagation flow')
+  .option('-e, --endpoint <endpoint>', 'runtime endpoint (default: most recent runtime for this account)')
+  .action(async (opts) => {
+    await ensureLoggedIn();
+    const { runtime, client } = getActive();
+    await driveMountCommand(runtime, client, { endpoint: opts.endpoint });
+  });
 
 // Graceful shutdown (daemons are independent processes and keep running)
 process.on('SIGINT', () => process.exit(0));
