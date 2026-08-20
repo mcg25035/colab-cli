@@ -4,7 +4,6 @@ import { AuthType } from '../colab/api.js';
 import { ColabClient } from '../colab/client.js';
 import { log } from '../logging/index.js';
 import { isJsonMode, notifyAuthUrl } from '../output/json-output.js';
-import { MountAuthManager } from '../drive/mount-auth.js';
 
 export class AuthConsentError extends Error {
   constructor(
@@ -22,16 +21,14 @@ export async function handleEphemeralAuth(
   authType: AuthType,
   serverLabel?: string,
 ): Promise<void> {
-  // When local Drive mount credentials are available, DriveFS is already
-  // running with our own metadata server — skip the remote propagation flow.
-  if (authType === AuthType.DFS_EPHEMERAL && MountAuthManager.isConfigured()) {
-    const mountAuth = new MountAuthManager();
-    if (mountAuth.isAuthorized()) {
-      log.trace(`[${authType}] Skipping propagation — local Drive mount credentials available`);
-      return;
-    }
-  }
-
+  // Colab backend's credentials-propagation flow:
+  //   1. dry-run query. If backend says success → already authorized, propagate.
+  //   2. If backend returns unauthorized_redirect_uri → user consents in
+  //      browser (backend pins login_hint to runtime owner's email, so users
+  //      cannot accidentally mount another account's Drive), then propagate.
+  // Phase 1 FIX4 dropped MurphyLo's "local DriveFS + fake metadata server"
+  // scheme in favor of this pure ephemeral flow. There are no local creds
+  // that should bypass propagation.
   const dryRunResult = await apiClient.propagateCredentials(endpoint, {
     authType,
     dryRun: true,
@@ -83,13 +80,11 @@ async function promptUserConsent(
   console.error(`\n${message}`);
   console.error(detail);
 
-  if (!isJsonMode()) {
-    const answer = await askQuestion('Allow? (y/n): ');
-    if (answer.toLowerCase() !== 'y') {
-      return false;
-    }
-  }
-
+  // Phase 1 post-test (Bug #6): the y/n consent prompt is skipped entirely —
+  // consent is treated as granted (auto-y). This keeps `drive-mount` (and any
+  // other ephemeral-auth consumer) usable from scripts/agents that run with a
+  // non-interactive stdin: the only required interaction is the URL + a final
+  // Enter to confirm the authorization finished in the browser.
   notifyAuthUrl(`${authType} authorization for ${label}`, unauthorizedRedirectUri);
   try {
     await open(unauthorizedRedirectUri);
