@@ -20,3 +20,36 @@ docs/error-records/*
 .firecrawl/
 scripts/
 !skills/**/scripts/
+
+# Local scratch test scripts (one-off battery / keepalive probes)
+battery-test.sh
+colab22.sh
+keepalive-test*.sh
+run-all-keepalive.sh
+TEST-STATE-SNAPSHOT.md
+
+# Phase 1 working docs — kept locally only (decision / progress / test reports)
+docs/CLUSTER-PHASE1-FIX1.md
+docs/CLUSTER-PHASE1-FIX2.md
+docs/CLUSTER-PHASE1-FIX3.md
+docs/CLUSTER-PHASE1-FIX4.md
+docs/CLUSTER-PHASE1-FIX5.md
+docs/CLUSTER-PHASE1-FIX6.md
+docs/CLUSTER-PHASE1-FIX7.md
+docs/CLUSTER-PHASE1-FIX45-S3-RETEST-KIT.md
+docs/CLUSTER-PHASE1-FIX45-S3-TEST-REPORT.md
+docs/CLUSTER-PHASE1-FIX45-S3-TEST-REPORT-r2.md
+docs/CLUSTER-PHASE1-FIX45-S3-TEST-REPORT-r3.md
+docs/CLUSTER-PHASE1-FIX45-TEST-KIT.md
+docs/CLUSTER-PHASE1-FIX45-TEST-REPORT.md
+docs/CLUSTER-PHASE1-FIX45-TEST-REPORT-r4.md
+docs/CLUSTER-PHASE1-TEST-REPORT.md
+docs/CLUSTER-PHASE1-TEST.md
+docs/CLUSTER-PHASE1.md
+docs/CLUSTER-CHANGES.md
+docs/CLUSTER-CONTEXT-HANDOFF.md
+docs/CLUSTER-POSTTEST-7BUGS.md
+docs/CLUSTER-PROGRESS.md
+docs/TEST-REPORT-2026-08-19.md
+docs/BACKLOG-DECISIONS-2026-08-20.md
+docs/CLUSTER.md
