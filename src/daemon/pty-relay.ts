@@ -422,8 +422,12 @@ export async function deployPtyRelay(opts: DeployPtyRelayOpts): Promise<PtyRelay
   const startHeartbeat = () => {
     heartbeatTimer = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      // Actually send the WS ping — without this no pong can ever arrive and
+      // every shell is force-closed ~2 ping cycles after open.
+      try { ws.ping(); } catch { /* socket tearing down */ }
       // Set pong timeout first; clear it when a pong arrives. On the next
       // ping cycle, if no pong has reset `missedPongs`, we increment it.
+      if (pongTimer) clearTimeout(pongTimer); // avoid stacking timers
       pongTimer = setTimeout(() => {
         missedPongs++;
         if (missedPongs >= 2) {
