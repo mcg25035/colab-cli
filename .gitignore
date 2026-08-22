@@ -53,3 +53,13 @@ docs/CLUSTER-PROGRESS.md
 docs/TEST-REPORT-2026-08-19.md
 docs/BACKLOG-DECISIONS-2026-08-20.md
 docs/CLUSTER.md
+
+# Shell stress-test work products — local only (test agent scripts, evidence, reports)
+artifacts/
+artifacts-run1/
+tmp/
+docs/B7-KILLPTYRELAY-CHANNEL-CONGESTION.md
+docs/PHASE1-SHELL-ROBUSTNESS-HANDOFF.md
+docs/SHELL-RECONNECT-VERIFICATION.md
+docs/SHELL-STRESS-TEST-PLAN.md
+docs/SHELL-WS-DISCONNECT-DIAGNOSIS.md
