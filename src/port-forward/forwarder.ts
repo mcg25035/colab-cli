@@ -19,8 +19,15 @@ export function createForwarder(
     agent: getProxyAgent(refresher.proxyUrl),
   });
 
-  proxy.on('error', (err: Error, _req: unknown, resOrSocket: http.ServerResponse | net.Socket) => {
-    log.error('Port forward proxy error:', err.message);
+  proxy.on('error', (err: Error, req: unknown, resOrSocket: http.ServerResponse | net.Socket) => {
+    // B4: include the target + request URL so a WS teardown is attributable
+    // (which shell/port-forward died, and where it was headed). The raw
+    // socket destroy for WS upgrades is intentional — the daemon-side
+    // reconnect loop (reconnectPtyRelay) owns recovery semantics.
+    const target = refresher.proxyUrl;
+    const url = req instanceof http.IncomingMessage ? req.url : undefined;
+    const kind = resOrSocket instanceof http.ServerResponse ? 'http' : 'ws';
+    log.error(`Port forward proxy error (${kind} -> ${target}${url ? ` url=${url}` : ''}):`, err.message);
     if (resOrSocket instanceof http.ServerResponse) {
       if (!resOrSocket.headersSent) {
         resOrSocket.writeHead(502);

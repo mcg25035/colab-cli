@@ -225,6 +225,7 @@ export async function shellListCommand(accountId: string): Promise<void> {
     status: string;
     startedAt: string;
     attached: boolean;
+    lastEvent?: string;
   }> = [];
 
   for (const server of servers) {
@@ -256,7 +257,8 @@ export async function shellListCommand(accountId: string): Promise<void> {
   console.log(header);
   for (const s of allShells) {
     const started = new Date(s.startedAt).toLocaleString();
-    console.log(`${s.shellId}\t${s.endpoint}\t${s.status}\t${started}\t${s.attached ? 'yes' : 'no'}`);
+    const status = s.lastEvent ? `${s.status} (${s.lastEvent})` : s.status;
+    console.log(`${s.shellId}\t${s.endpoint}\t${status}\t${started}\t${s.attached ? 'yes' : 'no'}`);
   }
 }
 
@@ -307,6 +309,22 @@ export async function shellSendCommand(
 
   try {
     await client.shellSend(shellId, data);
+  } finally {
+    client.close();
+  }
+}
+
+/**
+ * Explicitly close a background shell: unlike `--signal EOF` (which only
+ * delivers ^D to bash's stdin via the PTY and is swallowed when a
+ * foreground process like `python train.py` holds the terminal), this
+ * tears down the whole VM-side process tree of the shell immediately.
+ */
+export async function shellCloseCommand(accountId: string, shellId: number): Promise<void> {
+  const client = await findShellDaemon(accountId, shellId);
+  try {
+    await client.shellClose(shellId);
+    console.log(`Shell ${shellId} closed`);
   } finally {
     client.close();
   }
@@ -365,6 +383,14 @@ async function runShellSession(client: DaemonClient, shellId: number): Promise<v
     for await (const msg of client.shellStream()) {
       if (msg.type === 'shell_output') {
         stdout.write(msg.data);
+      } else if (msg.type === 'shell_status') {
+        // Transport reconnect transitions from the daemon: surface them so
+        // the user knows why output paused, without breaking the session.
+        if (msg.status === 'reconnecting') {
+          console.error(`\r\n\x1b[33m[shell ${shellId} connection lost — reconnecting…]\x1b[0m`);
+        } else if (msg.status === 'running') {
+          console.error(`\r\n\x1b[32m[shell ${shellId} reconnected]\x1b[0m`);
+        }
       } else if (msg.type === 'shell_closed') {
         console.error(`\r\n[shell ${shellId} closed: ${msg.reason}]`);
         break;
