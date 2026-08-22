@@ -250,6 +250,20 @@ export class DaemonClient {
     if (msg.type !== 'shell_send_ack') throw new Error(`Unexpected response: ${msg.type}`);
   }
 
+  /**
+   * Explicitly close a shell: VM-side relay process tree (relay + bash +
+   * any foreground job holding the PTY) is torn down immediately. Use this
+   * instead of `--signal EOF` when the shell's foreground process would
+   * otherwise survive (EOF only reaches bash's stdin after the foreground
+   * process exits).
+   */
+  async shellClose(shellId: number): Promise<void> {
+    this.send({ type: 'shell_close', shellId });
+    const msg = await this.nextMessage();
+    if (msg.type === 'shell_error') throw new Error(msg.message);
+    if (msg.type !== 'shell_closed') throw new Error(`Unexpected response: ${msg.type}`);
+  }
+
   /** Consume live shell output messages until shell_closed. */
   async *shellStream(): AsyncGenerator<ServerMessage> {
     while (true) {

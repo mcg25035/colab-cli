@@ -30,8 +30,10 @@ import {
   deployPtyRelay,
   closePtyRelay,
   killPtyRelay,
+  reconnectPtyRelay,
   relaySendStdin,
   relaySendResize,
+  sweepOrphanRelays,
   type PtyRelay,
 } from './pty-relay.js';
 
@@ -119,6 +121,8 @@ interface ActiveShell {
   attachedSocket?: net.Socket;
   startedAt: Date;
   status: ShellStatus;
+  /** Human-readable note on the current state (close reason / reconnect progress). */
+  lastEvent?: string;
   /** Last dimensions we advertised to the relay (also mirrored on `relay.buffer`).
    *  Snapshot rendering reads these so it knows what the bash side thinks it is. */
   cols: number;
@@ -128,7 +132,7 @@ interface ActiveShell {
 const DEFAULT_SHELL_COLS = 80;
 const DEFAULT_SHELL_ROWS = 24;
 
-const MAX_CONCURRENT_SHELLS = 10;
+const MAX_CONCURRENT_SHELLS = 40;
 const MAX_CONCURRENT_PORT_FORWARDS = 20;
 
 /**
@@ -423,6 +427,11 @@ async function main() {
   console.log('Connecting to kernel...');
   const kernelReady = kernel.connect().then(() => {
     console.log('Kernel connected');
+    // Startup sweep: this daemon just (re)attached to the runtime with an
+    // empty shell table, so any pty_relay process still on the VM is an
+    // orphan from a crashed daemon or a cleanup that failed under network
+    // disturbance. Kill them + remove their /tmp files (B2).
+    void sweepOrphanRelays(kernel).catch(() => {});
   });
   kernelReady.catch((err) => {
     console.error('Kernel connection failed:', err instanceof Error ? err.message : err);
@@ -499,6 +508,26 @@ async function main() {
     }
   }
 
+  // Backstop sweeper (B7): debounced 90s after the last shell close. If a
+  // killPtyRelay ever fails permanently (exec channel congestion, network
+  // disturbance at teardown time), this catches the leftover relay
+  // processes + /tmp files. Never touches relays of running/reconnecting
+  // shells (they're passed in as the live set).
+  let orphanSweepTimer: NodeJS.Timeout | undefined;
+  const scheduleOrphanSweep = () => {
+    if (orphanSweepTimer) clearTimeout(orphanSweepTimer);
+    orphanSweepTimer = setTimeout(() => {
+      orphanSweepTimer = undefined;
+      if (shuttingDown) return;
+      const live = [...shellState.shells.values()]
+        .filter((s) => s.status !== 'closed')
+        .map((s) => s.shellId);
+      kernelReady
+        .then(() => sweepOrphanRelays(kernel, live))
+        .catch(() => {});
+    }, 90_000);
+  };
+
   // Start Unix socket server early so CLI detects daemon quickly
   socketServer = net.createServer((socket) =>
     handleClient(
@@ -512,6 +541,7 @@ async function main() {
       forwardState,
       colabClient,
       server.endpoint,
+      scheduleOrphanSweep,
     ),
   );
 
@@ -553,6 +583,7 @@ function handleClient(
   },
   colabClient: ColabClient,
   endpoint: string,
+  scheduleOrphanSweep: () => void,
 ) {
   const send = (msg: ServerMessage) => {
     if (!socket.destroyed) socket.write(encode(msg));
@@ -564,10 +595,28 @@ function handleClient(
   // socket reference, then retain the entry briefly so a closing-curve
   // poll (`shell list`, snapshot attach) still sees the final state
   // before the relay + entry are evicted. No-op if already closed.
+  // Push a shell_status transition to the attached driver (if any) so live
+  // attach sessions can surface "reconnecting…" / "reconnected" immediately
+  // instead of guessing from output silence. Close transitions already send
+  // shell_closed via markShellClosed.
+  const pushShellStatus = (shell: ActiveShell) => {
+    if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
+      shell.attachedSocket.write(
+        encode({
+          type: 'shell_status',
+          shellId: shell.shellId,
+          status: shell.status,
+          ...(shell.lastEvent ? { reason: shell.lastEvent } : {}),
+        }),
+      );
+    }
+  };
+
   const markShellClosed = (shellId: number, reason: string) => {
     const shell = shellState.shells.get(shellId);
     if (!shell || shell.status === 'closed') return;
     shell.status = 'closed';
+    shell.lastEvent = reason;
     console.log(`Shell ${shellId} closed: ${reason}`);
     if (shell.attachedSocket && !shell.attachedSocket.destroyed) {
       shell.attachedSocket.write(encode({ type: 'shell_closed', shellId, reason }));
@@ -579,6 +628,7 @@ function handleClient(
       closePtyRelay(s.relay, kernel).catch(() => {});
       shellState.shells.delete(shellId);
     }, SHELL_CLOSED_RETENTION_MS);
+    scheduleOrphanSweep();
   };
 
   const rl = readline.createInterface({ input: socket });
@@ -853,8 +903,39 @@ function handleClient(
                   s.attachedSocket.write(encode({ type: 'shell_output', shellId, data: text }));
                 }
               },
-              onClose: () => {
-                markShellClosed(shellId, 'session ended');
+              onClose: (code, reason) => {
+                // Transport-level close (proxy hiccup, forward socket
+                // destroyed, heartbeat timeout terminate). The relay process
+                // on the VM is almost certainly still alive with bash +
+                // user jobs intact — enter `reconnecting` and retry the same
+                // local forward for up to the policy window instead of
+                // killing the shell. Only if the window expires (relay truly
+                // gone: bash exited → relay shutdown, runtime reclaimed,
+                // etc.) do we mark the shell closed. (B1)
+                const s = shellState.shells.get(shellId);
+                if (!s || s.status === 'closed') return;
+                s.status = 'reconnecting';
+                s.lastEvent = `transport lost (code ${code}${reason ? `: ${reason}` : ''}); reconnecting`;
+                console.log(`Shell ${shellId} transport lost (code=${code} reason=${JSON.stringify(reason)}); reconnecting`);
+                pushShellStatus(s);
+                void reconnectPtyRelay(s.relay).then((ok) => {
+                  const cur = shellState.shells.get(shellId);
+                  if (!cur || cur.status === 'closed' || cur.relay !== s.relay) return;
+                  if (ok) {
+                    cur.status = 'running';
+                    cur.lastEvent = 'reconnected';
+                    console.log(`Shell ${shellId} reconnected`);
+                    pushShellStatus(cur);
+                  } else {
+                    markShellClosed(shellId, `relay unreachable after reconnect window (last transport code ${code})`);
+                  }
+                });
+              },
+              onReconnectFailed: (attempt, err, nextDelayMs) => {
+                console.log(
+                  `Shell ${shellId} reconnect attempt ${attempt} failed: ${err.message}` +
+                    (nextDelayMs !== undefined ? ` (retry in ${nextDelayMs}ms)` : ''),
+                );
               },
               onError: (err) => {
                 console.error(`Shell ${shellId} relay WS error:`, err.message);
@@ -945,7 +1026,10 @@ function handleClient(
           const buffered = shell.relay.buffer.getContents();
           send({ type: 'shell_attached', shellId: msg.shellId, buffered });
 
-          if (msg.cols && msg.rows && shell.status === 'running') {
+          if (msg.cols && msg.rows) {
+            // status is known non-closed here (closed attaches return above);
+            // a resize during `reconnecting` just updates the remembered
+            // size and is re-sent to the relay on reconnect.
             relaySendResize(shell.relay, msg.cols, msg.rows);
             shell.cols = msg.cols;
             shell.rows = msg.rows;
@@ -960,6 +1044,7 @@ function handleClient(
           status: s.status,
           startedAt: s.startedAt.toISOString(),
           attached: s.attachedSocket !== undefined && !s.attachedSocket.destroyed,
+          ...(s.lastEvent ? { lastEvent: s.lastEvent } : {}),
         }));
         send({ type: 'shell_list_result', shells });
         break;
@@ -977,6 +1062,25 @@ function handleClient(
         // kernel sees exactly what we write in order).
         relaySendStdin(shell.relay, msg.data);
         send({ type: 'shell_send_ack', shellId: msg.shellId });
+        break;
+      }
+
+      case 'shell_close': {
+        // Explicit close, unlike EOF-into-PTY: tears down the VM-side relay
+        // process tree (pkill + process-group SIGKILL of bash/children) even
+        // when a foreground process still holds the PTY. This is the
+        // documented way to kill e.g. a background training shell. (B5)
+        const shell = shellState.shells.get(msg.shellId);
+        if (!shell || shell.status === 'closed') {
+          send({ type: 'shell_error', message: `Shell ${msg.shellId} not found or closed` });
+          return;
+        }
+        markShellClosed(msg.shellId, 'closed by user');
+        // Immediate teardown — don't wait for the retention-window sweeper.
+        closePtyRelay(shell.relay, kernel).catch((err) => {
+          console.error(`Shell ${msg.shellId} teardown after close failed:`, err instanceof Error ? err.message : err);
+        });
+        send({ type: 'shell_closed', shellId: msg.shellId, reason: 'closed by user' });
         break;
       }
 

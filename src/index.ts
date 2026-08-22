@@ -46,6 +46,7 @@ import {
   shellAttachCommand,
   shellListCommand,
   shellSendCommand,
+  shellCloseCommand,
 } from './commands/shell.js';
 import {
   portForwardCreateCommand,
@@ -647,6 +648,14 @@ shellCmd
       data: opts.data,
       signal: opts.signal,
     });
+  });
+
+shellCmd
+  .command('close <id>')
+  .description('close a shell session and kill its VM-side process tree (unlike EOF, works when a foreground process holds the PTY)')
+  .action(async (id: string) => {
+    await ensureLoggedIn();
+    await shellCloseCommand(getActive().runtime.getAccountId(), parseInt(id, 10));
   });
 
 // Port forwarding commands

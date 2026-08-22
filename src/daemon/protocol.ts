@@ -21,6 +21,7 @@ export type ClientMessage =
   | { type: 'shell_attach'; shellId: number; cols?: number; rows?: number; noWait?: boolean; tail?: number }
   | { type: 'shell_list' }
   | { type: 'shell_send'; shellId: number; data: string }
+  | { type: 'shell_close'; shellId: number }
   | {
       type: 'port_forward_create';
       localHost: string;
@@ -61,6 +62,7 @@ export type ServerMessage =
   | { type: 'shell_attach_batch'; shellId: number; buffered: string; status: ShellStatus }
   | { type: 'shell_list_result'; shells: ShellListEntry[] }
   | { type: 'shell_send_ack'; shellId: number }
+  | { type: 'shell_status'; shellId: number; status: ShellStatus; reason?: string }
   | {
       type: 'port_forward_created';
       id: number;
@@ -78,13 +80,15 @@ export function encode(msg: ClientMessage | ServerMessage): string {
   return JSON.stringify(msg) + '\n';
 }
 
-export type ShellStatus = 'running' | 'closed';
+export type ShellStatus = 'running' | 'reconnecting' | 'closed';
 
 export interface ShellListEntry {
   shellId: number;
   status: ShellStatus;
   startedAt: string;
   attached: boolean;
+  /** Human-readable note on the current state (e.g. close reason / reconnect progress). */
+  lastEvent?: string;
 }
 
 export interface PortForwardListEntry {

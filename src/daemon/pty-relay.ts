@@ -1,3 +1,4 @@
+import { readFileSync } from 'fs';
 import WebSocket from 'ws';
 import type { KernelConnection, KernelOutput } from '../jupyter/kernel-connection.js';
 import { ForwardSession } from '../port-forward/session.js';
@@ -16,21 +17,85 @@ export const SHELL_RELAY_PORT_BASE = 19000;
 const SHELL_RELAY_BOOTSTRAP_TIMEOUT_MS = 30_000;
 const SHELL_RELAY_BOOTSTRAP_POLL_INTERVAL_MS = 300;
 const SHELL_RELAY_WS_OPEN_TIMEOUT_MS = 15_000;
+
 /**
  * Daemon-side heartbeat to the relay. `ws` (unlike Python websockets) does
  * NOT enable client-side ping by default — an idle WS over Colab's proxy
  * can masquerade as alive forever even when the relay process died (TCP
  * RST not propagated back through the edge proxy). We ping every 30s; if
- * a pong doesn't arrive within 60s we mark the shell closed. Real network
- * jitter only delays things by multiples of the ping interval — a dropped
- * pong means the next ping resets the timeout; only three consecutive
- * pings with zero pongs triggers teardown. Threshold was chosen so a busy
- * relay going through Colab's wrapping proxy tolerates a 60s opaque
- * stall without being falsely diagnosed dead (the longest healthy-colab
- * stall observed in practice is ~40s during runtime reassignment).
+ * two consecutive pongs go missing we tear the connection down, which now
+ * triggers the reconnect loop rather than instantly killing the shell.
  */
 const SHELL_RELAY_HEARTBEAT_PING_INTERVAL_MS = 30_000;
 const SHELL_RELAY_HEARTBEAT_PONG_TIMEOUT_MS = 60_000;
+
+/**
+ * Reconnect policy for the daemon → relay WebSocket. On any transport-level
+ * close (proxy hiccup, edge restart, port-forward socket destroyed) we retry
+ * with exponential backoff inside a ~2 minute window before declaring the
+ * shell dead. The relay keeps buffering PTY output into its backlog while
+ * no client is connected, so a successful reconnect resyncs the stream
+ * transparently — the terminal keeps streaming (little-or-no data loss).
+ */
+export interface RelayReconnectPolicy {
+  /** Per-attempt delays (ms) between failed attempts and the next try. */
+  delaysMs: number[];
+  /** Total wall-clock budget (ms) from first close to giving up. */
+  budgetMs: number;
+  /** WS open timeout per attempt. */
+  openTimeoutMs: number;
+}
+
+export const DEFAULT_RECONNECT_POLICY: RelayReconnectPolicy = {
+  delaysMs: [500, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000, 15_000, 15_000],
+  budgetMs: 120_000,
+  openTimeoutMs: SHELL_RELAY_WS_OPEN_TIMEOUT_MS,
+};
+
+/** Max bytes of stdin buffered while the relay WS is down (256 KB). */
+const MAX_PENDING_INPUT_BYTES = 256 * 1024;
+
+/** Max attempts for kernel-exec based VM cleanup (killPtyRelay). */
+const KILL_RELAY_ATTEMPTS = 4;
+const KILL_RELAY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+
+/**
+ * Per-kernel FIFO for maintenance execs (kill/sweep). The kernel exec
+ * channel is a single Jupyter WebSocket — a burst of concurrent
+ * `kernel.execute` calls (e.g. 30 `shell close` in 3s) congests it: calls
+ * error out with "Connection was temporarily lost" and, worse, were
+ * silently swallowed (B7: 0/150 kills landed in the 3h-soak teardown).
+ * Serializing maintenance execs through this promise chain keeps bursts
+ * lossless; they just take a little longer. Interactive exec
+ * (runExecution) is already single-flight upstream and stays off this
+ * queue.
+ */
+const maintenanceQueues = new WeakMap<KernelConnection, Promise<unknown>>();
+
+function enqueueKernelMaintenance<T>(
+  kernel: KernelConnection,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = maintenanceQueues.get(kernel) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  maintenanceQueues.set(kernel, next);
+  return next;
+}
+
+/** Run a maintenance snippet and return its full textual output. */
+async function runKernelMaintenance(kernel: KernelConnection, code: string): Promise<string> {
+  return enqueueKernelMaintenance(kernel, async () => {
+    let out = '';
+    const outputs = await kernel.execute(code);
+    for await (const output of outputs) {
+      out += kernelOutputToText(output);
+      if (output.type === 'error') {
+        throw new Error(`${output.ename}: ${output.evalue}`);
+      }
+    }
+    return out;
+  });
+}
 
 /** ttyd protocol command bytes (binary frames, first byte is the cmd). */
 const TTYD_CMD_STDIN = 0x30;   // '0'
@@ -43,196 +108,7 @@ const TTYD_CMD_RESIZE = 0x31;  // '1'
  * the caller's cols/rows up front so the PTY winsize matches before bash
  * ever renders a prompt.
  */
-const PTY_RELAY_PY = `"""PTY relay (ttyd protocol): raw PTY <-> WebSocket frames.
-
-Usage: python3 pty_relay.py <port> [<cols> <rows>] [<executable> <args>...]
-
-Wire protocol (every frame is binary; first byte is the command byte):
-
-  client -> server:
-    '0' + pty input bytes       -> write stdin to PTY master
-    '1' + JSON {columns,rows}   -> TIOCSWINSZ + SIGWINCH
-  server -> client:
-    '0' + raw pty output bytes  -> forward to xterm stdout
-    '1' + utf8 title string     -> (ignored by CLI; browser only)
-    '2' + JSON client options   -> (ignored by CLI; browser only)
-
-One shell = one PTY + one bash + one websockets server. bash exit ->
-master_fd EOF -> relay shuts down -> WS clients dropped immediately so the
-caller observes close without keepalive trickery.
-
-Bootstrap race fix: bash is spawned at startup and emits its first prompt
-into master_fd before websockets.serve even listens (let alone before any
-WS client connects). The pump reads those bytes but has no client to
-forward to, so without a backlog buffer they would be silently dropped and
-a fresh "attach --no-wait" would see an empty screen. We queue early PTY
-bytes into backlog while clients is empty; the first client to connect
-flushes the backlog atomically before joining the live set.
-
-Race-safety: backlog_lock serializes the pump's queue-vs-broadcast decision
-AND the handler's snapshot-clear-addws-sendSnapshot. Holding the lock
-across "await ws.send(snapshot)" is intentional — it blocks the pump for
-the single-frame send (~us), but guarantees pump never observes the
-half-state "first_client_pending already cleared but clients still empty"
-mid-handler-flight (which would otherwise drop bytes into a backlog that
-no one ever flushes). No deadlock risk: pump and handler both acquire the
-same lock, never nested, never re-entrant.
-"""
-import asyncio, os, pty, subprocess, sys, struct, fcntl, termios, signal, json
-import websockets
-
-PORT = int(sys.argv[1])
-COLS = int(sys.argv[2]) if len(sys.argv) > 2 else 80
-ROWS = int(sys.argv[3]) if len(sys.argv) > 3 else 24
-argv = sys.argv[4:] or ['bash']
-clients: set = set()
-
-# Bytes the pump read from master_fd before any WS client connected — most
-# importantly, the bash startup prompt. The first client flushes these;
-# later clients see an empty backlog. See module-level comment above for
-# the race-safety argument.
-backlog: bytearray = bytearray()
-backlog_lock = asyncio.Lock()
-first_client_pending = True
-
-master_fd, slave_fd = pty.openpty()
-fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-
-
-def _acquire_controlling_tty():
-    """Run in child via preexec_fn before exec'ing bash:
-    (1) become a new session leader so tcsetpgrp has a target;
-    (2) acquire slave_fd as the controlling tty.
-
-    Without this, bash prints two stderr warnings on every boot
-    ("bash: cannot set terminal process group ...: Inappropriate
-    ioctl for device" and "bash: no job control in this shell")
-    because pty.openpty() opens both ends without O_NOCTTY cleared,
-    so the child never auto-acquires controlling tty, and bash's
-    tcsetpgrp fails. This is cosmetic harm (job control disabled)
-    but the noise pollutes every "attach --no-wait" snapshot.
-    """
-    os.setsid()
-    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-
-
-child = subprocess.Popen(argv, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=False, preexec_fn=_acquire_controlling_tty)
-os.close(slave_fd)
-print(f"RELAY-UP child={child.pid} port={PORT} size={ROWS}x{COLS}", flush=True)
-
-
-async def handler(ws):
-    global first_client_pending
-    # Atomically (under backlog_lock): snapshot backlog (only if we're the
-    # first client), clear it, add self to clients, AND send the snapshot.
-    # Pump acquires the same lock before its queue-vs-broadcast decision,
-    # so it never observes the half-state where first_client_pending is
-    # False but clients is still empty (which would lead to dropped bytes
-    # in backlog that no later client will flush).
-    async with backlog_lock:
-        if first_client_pending:
-            first_client_pending = False
-            snapshot = bytes(backlog)
-            backlog.clear()
-        else:
-            snapshot = b''
-        clients.add(ws)
-        if snapshot:
-            try:
-                await ws.send(snapshot)
-            except Exception:
-                # Best-effort flush — if send fails the live pump will pick
-                # up subsequent bytes anyway, and a redraw-triggering input
-                # from the caller recovers the (small, early) lost bytes.
-                pass
-    try:
-        async for msg in ws:
-            data = msg.encode('utf-8', 'surrogateescape') if isinstance(msg, str) else msg
-            if len(data) == 0:
-                continue
-            cmd = data[0]; payload = data[1:]
-            if cmd == 0x30:  # stdin
-                os.write(master_fd, payload)
-            elif cmd == 0x31:  # resize
-                try:
-                    spec = json.loads(payload.decode('utf-8'))
-                    cols = int(spec.get('columns', 80))
-                    rows = int(spec.get('rows', 24))
-                    winsize = struct.pack("HHHH", rows, cols, 0, 0)
-                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-                    try: os.kill(child.pid, signal.SIGWINCH)
-                    except Exception: pass
-                    print(f"RESIZE cols={cols} rows={rows}", flush=True)
-                except (ValueError, KeyError, json.JSONDecodeError) as e:
-                    print(f"resize-bad {e}: {payload[:60]!r}", flush=True)
-            else:
-                print(f"unknown cmd={chr(cmd)!r} len={len(payload)}", flush=True)
-    except Exception as e:
-        print("ws-err", type(e).__name__, str(e)[:60], flush=True)
-    finally:
-        clients.discard(ws)
-
-
-async def pump_pty_to_clients():
-    loop = asyncio.get_running_loop()
-    while True:
-        try:
-            data = await loop.run_in_executor(None, os.read, master_fd, 4096)
-        except OSError:
-            break
-        if not data:
-            break
-        framed = b'0' + data
-        # Atomically decide (under backlog_lock): still in pre-first-client
-        # phase (queue to backlog), or in live-broadcast phase (clients
-        # non-empty AND first_client_pending already cleared). Taking the
-        # lock before checking state prevents observing a momentary
-        # "clients empty + first_client_pending False" race that would
-        # otherwise orphan backlog bytes.
-        async with backlog_lock:
-            if first_client_pending or not clients:
-                backlog.extend(framed)
-                continue
-            live_clients = list(clients)
-        # Send OUTSIDE the lock — slow clients shouldn't block the next
-        # master_fd read or other handlers' lock acquisitions.
-        dead = []
-        for c in live_clients:
-            try: await c.send(framed)
-            except Exception: dead.append(c)
-        for c in dead:
-            clients.discard(c)
-            try: c.close()
-            except Exception: pass
-    print("PTY-EOF", flush=True)
-
-
-
-
-async def wait_child():
-    loop = asyncio.get_running_loop()
-    rc = await loop.run_in_executor(None, child.wait)
-    print(f"CHILD-EXIT rc={rc}", flush=True)
-
-
-async def main():
-    pump_task = asyncio.create_task(pump_pty_to_clients())
-    wait_task = asyncio.create_task(wait_child())
-    async with websockets.serve(handler, '0.0.0.0', PORT):
-        print(f"WS-UP :{PORT}", flush=True)
-        await asyncio.wait({pump_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
-        print("SHUTDOWN", flush=True)
-    try:
-        if child.poll() is None:
-            try: child.kill()
-            except Exception: pass
-    except Exception: pass
-    os.close(master_fd)
-
-
-asyncio.run(main())
-`;
+const PTY_RELAY_PY = readFileSync(new URL('./pty_relay.py', import.meta.url), 'utf8');
 
 export interface PtyRelay {
   /** Shell this relay belongs to (set by caller). */
@@ -241,19 +117,41 @@ export interface PtyRelay {
   port: number;
   /** Local port-forward tunneling to the relay port through Colab's edge proxy. */
   forward: ForwardSession;
-  /** Daemon-side WS client talking to the relay (already connected when returned). */
+  /** Daemon-side WS client talking to the relay (current connection; swapped on reconnect). */
   ws: WebSocket;
-  /** xterm-headless buffer used to render snapshot queries. */
+  /** xterm-headless buffer used to render snapshot queries (persists across reconnects). */
   buffer: TerminalBuffer;
+  /** Last advertised winsize; re-sent to the relay after every reconnect. */
+  cols: number;
+  rows: number;
+  /** Intentional teardown in progress — suppresses onClose/reconnect paths. */
+  closing: boolean;
+  /** Handlers wired to every (re)connection. */
+  handlers: PtyRelayHandlers;
+  /** Framed stdin bytes queued while the WS was down; flushed on reconnect. */
+  pendingInput: Buffer[];
+  pendingInputBytes: number;
+  /** In-flight reconnect loop, so overlapping close events don't double-drive. */
+  reconnectPromise?: Promise<boolean>;
+  /** Re-open the port-forward (e.g. after the local forward server died). */
+  reopenForward: () => Promise<void>;
 }
 
 export interface PtyRelayHandlers {
   /** Fired for every stdout chunk ('0' frame) coming back from the PTY. */
   onOutput?: (text: string) => void;
-  /** Fired when the relay WS closes (bash exited, port-forward dropped, etc.). */
-  onClose?: () => void;
+  /**
+   * Fired when the relay WS closes (code/reason logged daemon-side before
+   * this). The caller decides whether to start a reconnect loop
+   * (reconnectPtyRelay) or mark the shell closed.
+   */
+  onClose?: (code: number, reason: string) => void;
   /** Fired on relay WS error (typically a fatal sub-protocol failure). */
   onError?: (err: Error) => void;
+  /** Fired when a reconnect attempt fails; attempt is 1-based. */
+  onReconnectFailed?: (attempt: number, err: Error, nextDelayMs: number | undefined) => void;
+  /** Fired when a reconnect succeeds (after backlog replay frames start arriving). */
+  onReconnected?: () => void;
 }
 
 export interface DeployPtyRelayOpts {
@@ -269,6 +167,172 @@ export interface DeployPtyRelayOpts {
 }
 
 /**
+ * Open + wire one daemon-side WS client connection to the relay through the
+ * relay's current port-forward: listeners are attached BEFORE awaiting
+ * 'open' (no first-message race), heartbeat is armed after open, the last
+ * known winsize is re-sent, and any stdin queued during the outage is
+ * flushed. Throws if the connection cannot be established.
+ */
+export async function connectRelay(relay: PtyRelay, openTimeoutMs = SHELL_RELAY_WS_OPEN_TIMEOUT_MS): Promise<void> {
+  const wsUrl = `ws://${relay.forward.localHost}:${relay.forward.localPort}/`;
+  const ws = new WebSocket(wsUrl);
+
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let pongTimer: ReturnType<typeof setTimeout> | undefined;
+  let missedPongs = 0;
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
+    if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
+  };
+  const startHeartbeat = () => {
+    heartbeatTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.ping(); } catch { /* socket tearing down */ }
+      if (pongTimer) clearTimeout(pongTimer); // avoid stacking timers
+      pongTimer = setTimeout(() => {
+        missedPongs++;
+        if (missedPongs >= 2) {
+          log.warn(`pty_relay ${relay.shellId}: heartbeat timeout (2 missed pongs); dropping connection (reconnect will follow)`);
+          try { ws.terminate(); } catch { /* best-effort */ }
+        }
+      }, SHELL_RELAY_HEARTBEAT_PONG_TIMEOUT_MS);
+    }, SHELL_RELAY_HEARTBEAT_PING_INTERVAL_MS);
+  };
+
+  const handleMessage = (data: WebSocket.RawData) => {
+    const buf: Buffer = Array.isArray(data)
+      ? Buffer.concat(data as Buffer[])
+      : data instanceof ArrayBuffer
+        ? Buffer.from(data)
+        : (data as Buffer);
+    if (buf.length === 0) return;
+    const cmd = buf[0];
+    const payload = buf.subarray(1);
+    if (cmd === TTYD_CMD_STDIN /* '0' = stdout from relay's POV */) {
+      const text = payload.toString('utf8');
+      relay.buffer.append(text);
+      relay.handlers.onOutput?.(text);
+    }
+    // '1' (title) and '2' (client options) are browser-only — ignored.
+  };
+  const handleClose = (code: number, reasonBuf: Buffer) => {
+    stopHeartbeat();
+    const reason = reasonBuf?.toString('utf8') ?? '';
+    // B4: always log close code + reason — abnormal deaths must be
+    // attributable from the daemon log (proxy-forced 1006 vs relay
+    // shutdown 1001 vs heartbeat terminate).
+    log.debug(`pty_relay ${relay.shellId}: WS closed code=${code} reason=${JSON.stringify(reason)}`);
+    if (relay.closing) return;
+    relay.handlers.onClose?.(code, reason);
+  };
+  const handleError = (err: Error) => {
+    log.warn(`pty_relay ${relay.shellId}: WS error:`, err.message);
+    relay.handlers.onError?.(err);
+  };
+
+  ws.on('message', handleMessage);
+  ws.on('close', handleClose);
+  ws.on('error', handleError);
+  ws.on('pong', () => {
+    missedPongs = 0;
+    if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
+  });
+
+  relay.ws = ws;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`WS open to ${wsUrl} timed out after ${openTimeoutMs}ms`));
+      }, openTimeoutMs);
+      const onOpen = () => { cleanup(); resolve(); };
+      const onError = (err: Error) => {
+        cleanup();
+        reject(new Error(`WS open to ${wsUrl} failed: ${err.message}`));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.off('open', onOpen);
+        ws.off('error', onError);
+      };
+      ws.once('open', onOpen);
+      ws.once('error', onError);
+    });
+  } catch (err) {
+    stopHeartbeat();
+    try { ws.close(); } catch { /* already closing */ }
+    throw err;
+  }
+
+  // Re-advertise the last known winsize so the PTY matches what clients
+  // last rendered (also arms the relay's SIGWINCH path).
+  relaySendResizeRaw(ws, relay.cols, relay.rows);
+
+  // Flush stdin queued while the connection was down, in order.
+  if (relay.pendingInput.length > 0) {
+    const queued = relay.pendingInput;
+    relay.pendingInput = [];
+    relay.pendingInputBytes = 0;
+    for (const framed of queued) {
+      try { ws.send(framed); } catch { break; }
+    }
+  }
+
+  startHeartbeat();
+}
+
+/**
+ * Reconnect the daemon → relay WS after a transport-level close, retrying
+ * with exponential backoff inside the policy window. Never redeploys or
+ * restarts the VM-side relay — user state (bash, running jobs) survives.
+ * The relay buffers PTY output into its backlog while no client is
+ * connected, so a successful reconnect replays the gap transparently.
+ *
+ * Returns true on success (new connection live), false if the policy window
+ * expired (caller should then mark the shell closed and clean up).
+ */
+export function reconnectPtyRelay(
+  relay: PtyRelay,
+  policy: RelayReconnectPolicy = DEFAULT_RECONNECT_POLICY,
+): Promise<boolean> {
+  // Collapse overlapping close events (error+close pairs, heartbeat
+  // terminate + close) into a single reconnect loop.
+  if (relay.reconnectPromise) return relay.reconnectPromise;
+
+  relay.reconnectPromise = (async () => {
+    const deadline = Date.now() + policy.budgetMs;
+    let attempt = 0;
+    try {
+      while (!relay.closing && Date.now() < deadline) {
+        attempt += 1;
+        try {
+          await connectRelay(relay, policy.openTimeoutMs);
+          relay.handlers.onReconnected?.();
+          return true;
+        } catch (err) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          // Local forward server gone (ECONNREFUSED) — reopen the
+          // port-forward before the next attempt.
+          if (/ECONNREFUSED/.test(e.message)) {
+            try { await relay.reopenForward(); } catch { /* try again next attempt */ }
+          }
+          const nextDelay = policy.delaysMs[Math.min(attempt - 1, policy.delaysMs.length - 1)];
+          relay.handlers.onReconnectFailed?.(attempt, e, nextDelay);
+          if (relay.closing) return false;
+          await new Promise((r) => setTimeout(r, nextDelay ?? 0));
+        }
+      }
+      return false;
+    } finally {
+      relay.reconnectPromise = undefined;
+    }
+  })();
+
+  return relay.reconnectPromise;
+}
+
+/**
  * Bootstrap a per-shell PTY relay on the VM and connect a daemon-side WS
  * client to it through a freshly-opened port-forward.
  *
@@ -278,10 +342,7 @@ export interface DeployPtyRelayOpts {
  *   3. nohup-launch it (killing any stale copy first), polling the log
  *      until 'WS-UP' appears (or timeout)
  *   4. open a Colab port-forward: 127.0.0.1:<os-port> -> remote <$port>
- *   5. open the daemon-side WS client to ws://127.0.0.1:<forward.localPort>/
- *      and wire its 'message'/'close'/'error' handlers up front to avoid
- *      the "first message arrives before listener is attached" race
- *   6. send the initial resize (caller's cols/rows)
+ *   5. open the daemon-side WS client (connectRelay)
  *
  * On any failure the partial resources (port-forward, relay script) are
  * torn down so a naive `shell_open` retry doesn't accumulate garbage.
@@ -345,223 +406,232 @@ export async function deployPtyRelay(opts: DeployPtyRelayOpts): Promise<PtyRelay
   }
 
   // 2. open port-forward: local OS-assigned port -> remote $port
+  const openForward = () =>
+    ForwardSession.open(0, localHost, 0, port, opts.colabClient, opts.endpoint, undefined);
+
   let forward: ForwardSession;
   try {
-    forward = await ForwardSession.open(
-      /* id (unused; not registered in forwardState) */ 0,
-      localHost,
-      /* localPort: 0 = OS-assigned, avoids collisions across shells */ 0,
-      port,
-      opts.colabClient,
-      opts.endpoint,
-      undefined,
-    );
+    forward = await openForward();
   } catch (err) {
     await killPtyRelay(opts.kernel, shellId).catch(() => {});
     throw new Error(`failed to open port-forward to relay port ${port}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // 3. open the daemon-side WS client. Listeners must be wired BEFORE we
-  // await 'open' so an early bash prompt (relay pumps output to clients
-  // the instant their WS connects) doesn't arrive before 'message' is set.
-  const buffer = new TerminalBuffer(undefined, cols, rows);
-  const wsUrl = `ws://${forward.localHost}:${forward.localPort}/`;
-  const ws = new WebSocket(wsUrl);
-  let closed = false;
-
-  const handleClose = () => {
-    if (closed) return;
-    closed = true;
-    log.debug(`pty_relay ${shellId}: WS closed`);
-    opts.handlers.onClose?.();
-  };
-  const handleError = (err: Error) => {
-    if (closed) return;
-    log.warn(`pty_relay ${shellId}: WS error:`, err.message);
-    opts.handlers.onError?.(err);
-  };
-  const handleMessage = (data: WebSocket.RawData, isBinary: boolean) => {
-    // Normalize the RawData union (`Buffer | ArrayBuffer | Buffer[]`) to a
-    // single Buffer. The relay always sends binary frames, so in practice
-    // we'll see `Buffer` (the default binaryType='nodebuffer' delivers both
-    // binary AND text frames as Buffer), but we cover the other arms
-    // defensively so the type narrowing is exhaustive. `isBinary` is unused
-    // — we treat text frames identically since ws already decoded them to
-    // UTF-8 bytes in the Buffer.
-    void isBinary;
-    const buf: Buffer = Array.isArray(data)
-      ? Buffer.concat(data as Buffer[])
-      : data instanceof ArrayBuffer
-        ? Buffer.from(data)
-        : (data as Buffer);
-    if (buf.length === 0) return;
-    const cmd = buf[0];
-    const payload = buf.subarray(1);
-    if (cmd === TTYD_CMD_STDIN /* '0' = stdout from relay's POV */) {
-      const text = payload.toString('utf8');
-      buffer.append(text);
-      opts.handlers.onOutput?.(text);
-    }
-    // '1' (title) and '2' (client options) are browser-only — ignored.
+  const relay: PtyRelay = {
+    shellId,
+    port,
+    forward,
+    ws: undefined as unknown as WebSocket, // set by connectRelay below
+    buffer: new TerminalBuffer(undefined, cols, rows),
+    cols,
+    rows,
+    closing: false,
+    handlers: opts.handlers,
+    pendingInput: [],
+    pendingInputBytes: 0,
+    reopenForward: async () => {
+      const fresh = await openForward();
+      const old = relay.forward;
+      relay.forward = fresh;
+      try { await old.close(); } catch { /* best-effort */ }
+    },
   };
 
-  ws.on('message', handleMessage);
-  ws.on('close', handleClose);
-  ws.on('error', handleError);
-
-  // Heartbeat: periodic ping + hard pong timeout. `ws` does NOT auto-ping
-  // on the client side; without this an idle relay that died on the VM
-  // (process killed, runtime recycled, etc.) would never trigger our
-  // `close` handler if Colab's edge proxy doesn't forward the TCP RST back
-  // to us — which has been observed. Python `websockets` lib auto-pongs
-  // incoming pings (RFC 6455 server-side obligation), so a live relay will
-  // always respond. Two consecutive missed pongs → teardown.
-  let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
-  let pongTimer: ReturnType<typeof setTimeout> | undefined;
-  let missedPongs = 0;
-  const startHeartbeat = () => {
-    heartbeatTimer = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      // Set pong timeout first; clear it when a pong arrives. On the next
-      // ping cycle, if no pong has reset `missedPongs`, we increment it.
-      pongTimer = setTimeout(() => {
-        missedPongs++;
-        if (missedPongs >= 2) {
-          log.warn(`pty_relay ${shellId}: heartbeat timeout (2 missed pongs); forcing close`);
-          // `ws.terminate()` aborts the underlying socket and emits
-          // 'close' → `handleClose` runs `onClose` → markShellClosed.
-          try { (ws as unknown as { terminate: () => void }).terminate(); }
-          catch { /* best-effort */ }
-        }
-      }, SHELL_RELAY_HEARTBEAT_PONG_TIMEOUT_MS);
-    }, SHELL_RELAY_HEARTBEAT_PING_INTERVAL_MS);
-  };
-  ws.on('pong', () => {
-    missedPongs = 0;
-    if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
-  });
-  const stopHeartbeat = () => {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
-    if (pongTimer) { clearTimeout(pongTimer); pongTimer = undefined; }
-  };
-  ws.on('close', () => stopHeartbeat());
-  ws.on('error', () => stopHeartbeat());
-
-  // 4. wait for WS open with timeout. On timeout we tear down forward +
-  //    kill the VM relay so a retry starts from a clean slate.
+  // 3. open the daemon-side WS client. On failure, tear everything down so
+  //    a retry starts from a clean slate.
   try {
-    await new Promise<void>((resolve, reject) => {
-      const onOpen = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = (err: Error) => {
-        cleanup();
-        reject(new Error(`WS open to ${wsUrl} failed: ${err.message}`));
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`WS open to ${wsUrl} timed out after ${SHELL_RELAY_WS_OPEN_TIMEOUT_MS}ms`));
-      }, SHELL_RELAY_WS_OPEN_TIMEOUT_MS);
-      const cleanup = () => {
-        clearTimeout(timer);
-        ws.off('open', onOpen);
-        ws.off('error', onError);
-      };
-      ws.once('open', onOpen);
-      ws.once('error', onError);
-    });
+    relay.closing = true; // suppress onClose/reconnect during teardown-on-failure
+    await connectRelay(relay);
+    relay.closing = false;
   } catch (err) {
-    try { ws.close(); } catch { /* already closing */ }
+    try { relay.ws?.close(); } catch { /* already closing */ }
     await forward.close().catch(() => {});
     await killPtyRelay(opts.kernel, shellId).catch(() => {});
-    buffer.dispose();
+    relay.buffer.dispose();
     throw err;
   }
 
-  // 5. send initial resize so the relay's PTY winsize mirrors the caller's
-  //    desired cols/rows (the script already set this at spawn time, but
-  //    explicit resize also arms the SIGWINCH code path clients depend on).
-  relaySendResizeRaw(ws, cols, rows);
-
-  // 6. arm the heartbeat now that the WS is confirmed open. A ping emitted
-  //    immediately after open mortgages against the relay dying between
-  //    opening and the next shell_input; this is the phantom-entry edge case
-  //    documented in the r4 test report.
-  startHeartbeat();
-
-  return { shellId, port, forward, ws, buffer };
+  return relay;
 }
 
 /**
  * Send stdin bytes to the bash running under this relay (ttyd '0' frame).
- * No-op if the WS isn't open — the close handler on the relay has already
- * (or will shortly) mark the shell as closed for the caller.
+ * If the WS is down (reconnect in progress) the bytes are queued (bounded
+ * by MAX_PENDING_INPUT_BYTES) and flushed on reconnect, in order.
+ * Returns 'sent' | 'queued' | 'dropped' (queue full — bytes were lost).
  */
-export function relaySendStdin(relay: PtyRelay, data: string): void {
-  if (relay.ws.readyState !== WebSocket.OPEN) return;
-  relaySendStdinRaw(relay.ws, data);
-}
-
-/**
- * Send a winsize update to the relay (ttyd '1' frame). Also updates the
- * buffer's render dimensions so subsequent snapshot queries are accurate.
- */
-export function relaySendResize(relay: PtyRelay, cols: number, rows: number): void {
-  relay.buffer.resize(cols, rows);
-  if (relay.ws.readyState !== WebSocket.OPEN) return;
-  relaySendResizeRaw(relay.ws, cols, rows);
-}
-
-/**
- * Kill the VM-side relay process for this shellId and remove its script +
- * log files. Safe to call multiple times (subsequent calls are no-ops once
- * the process is gone). Used both on explicit shell teardown and as the
- * fallback sweeper when the WS closes unexpectedly.
- */
-export async function killPtyRelay(kernel: KernelConnection, shellId: number): Promise<void> {
-  const scriptPath = `/tmp/pty_relay_${shellId}.py`;
-  const logPath = `/tmp/pty_relay_${shellId}.log`;
-  const killCode = [
-    `import subprocess, os`,
-    `subprocess.run(['pkill', '-f', ${JSON.stringify(scriptPath)}], timeout=3)`,
-    `for p in [${JSON.stringify(scriptPath)}, ${JSON.stringify(logPath)}]:`,
-    `    try: os.remove(p)`,
-    `    except Exception: pass`,
-    `print('v-clean')`,
-  ].join('\n');
-  try {
-    const outputs = await kernel.execute(killCode);
-    for await (const _ of outputs) { /* drain */ }
-  } catch (err) {
-    log.warn(`killPtyRelay ${shellId}: kernel exec failed:`, err instanceof Error ? err.message : String(err));
-  }
-}
-
-/**
- * Tear everything down for a relay that's no longer needed: close the WS,
- * close the port-forward, dispose the buffer, and sweep the VM-side
- * process. All steps are best-effort — no error here should mask the
- * original cause that triggered the teardown.
- */
-export async function closePtyRelay(relay: PtyRelay, kernel: KernelConnection): Promise<void> {
-  try { relay.ws.close(); } catch { /* ignore */ }
-  try { await relay.forward.close(); } catch (err) {
-    log.debug(`closePtyRelay ${relay.shellId}: forward.close failed:`, err instanceof Error ? err.message : String(err));
-  }
-  try { relay.buffer.dispose(); } catch { /* ignore */ }
-  await killPtyRelay(kernel, relay.shellId).catch(() => {});
-}
-
-// ── internal helpers ──
-
-function relaySendStdinRaw(ws: WebSocket, data: string): void {
+export function relaySendStdin(relay: PtyRelay, data: string): 'sent' | 'queued' | 'dropped' {
   const src = Buffer.from(data, 'utf8');
   const framed = Buffer.allocUnsafe(1 + src.length);
   framed[0] = TTYD_CMD_STDIN;
   src.copy(framed, 1);
-  ws.send(framed);
+
+  if (relay.ws && relay.ws.readyState === WebSocket.OPEN) {
+    relay.ws.send(framed);
+    return 'sent';
+  }
+  if (relay.closing) return 'dropped';
+  if (relay.pendingInputBytes + framed.length > MAX_PENDING_INPUT_BYTES) {
+    log.warn(`pty_relay ${relay.shellId}: pending input buffer full (${relay.pendingInputBytes}B); dropping ${framed.length}B of stdin`);
+    return 'dropped';
+  }
+  relay.pendingInput.push(framed);
+  relay.pendingInputBytes += framed.length;
+  return 'queued';
 }
+
+/**
+ * Send a winsize update to the relay (ttyd '1' frame). Remembers the size
+ * (re-sent on every reconnect) and updates the buffer's render dimensions
+ * so subsequent snapshot queries are accurate.
+ */
+export function relaySendResize(relay: PtyRelay, cols: number, rows: number): void {
+  relay.cols = cols;
+  relay.rows = rows;
+  relay.buffer.resize(cols, rows);
+  if (relay.ws && relay.ws.readyState === WebSocket.OPEN) {
+    relaySendResizeRaw(relay.ws, cols, rows);
+  }
+}
+
+/**
+ * Kill the VM-side relay process tree for this shellId and remove its
+ * script + log files. Serialized through the per-kernel maintenance queue
+ * (bursts can't congest the single exec channel), confirmed by requiring
+ * the snippet's final `v-clean relay=gone` status line, retried with
+ * backoff, and every attempt logged with its outcome. Returns true when
+ * the kill was positively confirmed.
+ *
+ * Process-tree kill: bash was spawned with setsid (pgid == its pid), but
+ * interactive bash puts each foreground job in its own process group —
+ * killing only the relay or only bash's pgrp orphans jobs like
+ * `sleep 600`. We read the child pid from the relay log and SIGKILL every
+ * process sharing bash's session id.
+ */
+export async function killPtyRelay(kernel: KernelConnection, shellId: number): Promise<boolean> {
+  const scriptPath = `/tmp/pty_relay_${shellId}.py`;
+  const logPath = `/tmp/pty_relay_${shellId}.log`;
+  const killCode = [
+    `import subprocess, os, re, signal`,
+    `session_killed = 0`,
+    `try:`,
+    `    log = open(${JSON.stringify(logPath)}).read()`,
+    `    m = re.search(r'RELAY-UP child=(\\d+)', log)`,
+    `    if m:`,
+    `        pid = int(m.group(1))`,
+    `        # kill the whole session: interactive bash puts each foreground job in`,
+    `        # its own process group, so killpg(bash) alone orphans jobs like sleep`,
+    `        for p in os.listdir('/proc'):`,
+    `            if not p.isdigit(): continue`,
+    `            try:`,
+    `                st = open('/proc/'+p+'/stat').read()`,
+    `                if int(st[st.rfind(')')+2:].split()[3]) == pid:  # session id`,
+    `                    try: os.kill(int(p), signal.SIGKILL); session_killed += 1`,
+    `                    except (ProcessLookupError, PermissionError): pass`,
+    `            except Exception: pass`,
+    `        try: os.killpg(pid, signal.SIGKILL)  # pgid == bash pid (setsid)`,
+    `        except (ProcessLookupError, PermissionError): pass`,
+    `        try: os.kill(pid, signal.SIGKILL)`,
+    `        except (ProcessLookupError, PermissionError): pass`,
+    `except Exception as e:`,
+    `    print('session-scan-error', e)`,
+    `subprocess.run(['pkill', '-f', ${JSON.stringify(scriptPath)}], timeout=3)`,
+    `# confirm: is the relay process actually gone?`,
+    `chk = subprocess.run(['pgrep', '-f', ${JSON.stringify(scriptPath)}], capture_output=True, text=True)`,
+    `alive = [l for l in chk.stdout.splitlines() if l.strip() and 'pgrep' not in l]`,
+    `files_removed = 0`,
+    `for p in [${JSON.stringify(scriptPath)}, ${JSON.stringify(logPath)}]:`,
+    `    try: os.remove(p); files_removed += 1`,
+    `    except Exception: pass`,
+    `print(f'v-clean relay={"alive" if alive else "gone"} session_killed={session_killed} files_removed={files_removed}')`,
+  ].join('\n');
+
+  for (let attempt = 0; attempt < KILL_RELAY_ATTEMPTS; attempt++) {
+    const backoff = KILL_RELAY_BACKOFF_MS[Math.min(attempt, KILL_RELAY_BACKOFF_MS.length - 1)];
+    if (backoff > 0) await new Promise((r) => setTimeout(r, backoff));
+    try {
+      const out = await runKernelMaintenance(kernel, killCode);
+      if (out.includes('v-clean') && out.includes('relay=gone')) {
+        const summary = out.match(/v-clean[^\n]*/)?.[0] ?? 'v-clean';
+        log.info(`killPtyRelay ${shellId}: ok (attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS}) ${summary}`);
+        return true;
+      }
+      log.warn(
+        `killPtyRelay ${shellId}: attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS} exec ran but relay not confirmed gone. Output tail: ${out.slice(-300)}`,
+      );
+    } catch (err) {
+      log.warn(
+        `killPtyRelay ${shellId}: exec failed (attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS}):`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  log.warn(`killPtyRelay ${shellId}: all ${KILL_RELAY_ATTEMPTS} attempts failed; relay/files may linger (backstop sweeper will retry)`);
+  return false;
+}
+
+/**
+ * Orphan sweep: kill every `pty_relay` process on the VM whose shellId is
+ * NOT in `liveShellIds` (orphans from a crashed daemon or a killPtyRelay
+ * that exhausted its retries), and remove their /tmp files. Relays on the
+ * live list are never touched. Serialized through the same maintenance
+ * queue so it can't congest the exec channel either.
+ */
+export async function sweepOrphanRelays(
+  kernel: KernelConnection,
+  liveShellIds: number[] = [],
+): Promise<void> {
+  const sweepCode = [
+    `import subprocess, glob, os, re`,
+    `live = {${liveShellIds.join(',')}}`,
+    `killed = 0; removed = 0`,
+    `for path in glob.glob('/tmp/pty_relay_*.py'):`,
+    `    m = re.match(r'/tmp/pty_relay_(\\d+)\\.py$', path)`,
+    `    if not m: continue`,
+    `    sid = int(m.group(1))`,
+    `    if sid in live: continue`,
+    `    subprocess.run(['pkill', '-f', path], timeout=3)`,
+    `    killed += 1`,
+    `    for p in (path, path[:-3] + '.log'):`,
+    `        try: os.remove(p); removed += 1`,
+    `        except Exception: pass`,
+    `print(f'sweep killed={killed} removed={removed} live={${liveShellIds.length}}')`,
+  ].join('\n');
+  try {
+    const out = await runKernelMaintenance(kernel, sweepCode);
+    log.info(`sweepOrphanRelays: ${out.trim().split('\n').pop() ?? 'done'}`);
+  } catch (err) {
+    log.warn('sweepOrphanRelays: exec failed:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Tear everything down for a relay that's no longer needed: suppress the
+ * reconnect path, close the WS, close the port-forward, dispose the buffer,
+ * and kill the VM-side process tree. Errors are logged, never swallowed —
+ * a failed VM-side kill is visible in the daemon log and left to the
+ * backstop sweeper.
+ */
+export async function closePtyRelay(relay: PtyRelay, kernel: KernelConnection): Promise<void> {
+  relay.closing = true;
+  relay.pendingInput = [];
+  relay.pendingInputBytes = 0;
+  try { relay.ws.close(); } catch { /* ignore */ }
+  try { await relay.forward.close(); } catch (err) {
+    log.warn(`closePtyRelay ${relay.shellId}: forward.close failed:`, err instanceof Error ? err.message : String(err));
+  }
+  try { relay.buffer.dispose(); } catch { /* ignore */ }
+  try {
+    const ok = await killPtyRelay(kernel, relay.shellId);
+    if (!ok) {
+      log.warn(`closePtyRelay ${relay.shellId}: VM-side kill not confirmed; backstop sweeper will retry`);
+    }
+  } catch (err) {
+    log.warn(`closePtyRelay ${relay.shellId}: killPtyRelay threw:`, err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ── internal helpers ──
 
 function relaySendResizeRaw(ws: WebSocket, cols: number, rows: number): void {
   const payload = JSON.stringify({ columns: cols, rows: rows });
@@ -580,3 +650,6 @@ function kernelOutputToText(output: KernelOutput): string {
   if (output.type === 'status') return `[${output.executionState}]\n`;
   return '';
 }
+
+
+
