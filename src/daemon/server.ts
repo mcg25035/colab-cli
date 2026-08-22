@@ -508,6 +508,26 @@ async function main() {
     }
   }
 
+  // Backstop sweeper (B7): debounced 90s after the last shell close. If a
+  // killPtyRelay ever fails permanently (exec channel congestion, network
+  // disturbance at teardown time), this catches the leftover relay
+  // processes + /tmp files. Never touches relays of running/reconnecting
+  // shells (they're passed in as the live set).
+  let orphanSweepTimer: NodeJS.Timeout | undefined;
+  const scheduleOrphanSweep = () => {
+    if (orphanSweepTimer) clearTimeout(orphanSweepTimer);
+    orphanSweepTimer = setTimeout(() => {
+      orphanSweepTimer = undefined;
+      if (shuttingDown) return;
+      const live = [...shellState.shells.values()]
+        .filter((s) => s.status !== 'closed')
+        .map((s) => s.shellId);
+      kernelReady
+        .then(() => sweepOrphanRelays(kernel, live))
+        .catch(() => {});
+    }, 90_000);
+  };
+
   // Start Unix socket server early so CLI detects daemon quickly
   socketServer = net.createServer((socket) =>
     handleClient(
@@ -521,6 +541,7 @@ async function main() {
       forwardState,
       colabClient,
       server.endpoint,
+      scheduleOrphanSweep,
     ),
   );
 
@@ -562,6 +583,7 @@ function handleClient(
   },
   colabClient: ColabClient,
   endpoint: string,
+  scheduleOrphanSweep: () => void,
 ) {
   const send = (msg: ServerMessage) => {
     if (!socket.destroyed) socket.write(encode(msg));
@@ -606,6 +628,7 @@ function handleClient(
       closePtyRelay(s.relay, kernel).catch(() => {});
       shellState.shells.delete(shellId);
     }, SHELL_CLOSED_RETENTION_MS);
+    scheduleOrphanSweep();
   };
 
   const rl = readline.createInterface({ input: socket });

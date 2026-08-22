@@ -54,9 +54,47 @@ export const DEFAULT_RECONNECT_POLICY: RelayReconnectPolicy = {
 /** Max bytes of stdin buffered while the relay WS is down (256 KB). */
 const MAX_PENDING_INPUT_BYTES = 256 * 1024;
 
-/** Max retry attempts for kernel-exec based VM cleanup (killPtyRelay). */
-const KILL_RELAY_ATTEMPTS = 3;
-const KILL_RELAY_BACKOFF_MS = [0, 2_000, 5_000];
+/** Max attempts for kernel-exec based VM cleanup (killPtyRelay). */
+const KILL_RELAY_ATTEMPTS = 4;
+const KILL_RELAY_BACKOFF_MS = [0, 5_000, 15_000, 30_000];
+
+/**
+ * Per-kernel FIFO for maintenance execs (kill/sweep). The kernel exec
+ * channel is a single Jupyter WebSocket — a burst of concurrent
+ * `kernel.execute` calls (e.g. 30 `shell close` in 3s) congests it: calls
+ * error out with "Connection was temporarily lost" and, worse, were
+ * silently swallowed (B7: 0/150 kills landed in the 3h-soak teardown).
+ * Serializing maintenance execs through this promise chain keeps bursts
+ * lossless; they just take a little longer. Interactive exec
+ * (runExecution) is already single-flight upstream and stays off this
+ * queue.
+ */
+const maintenanceQueues = new WeakMap<KernelConnection, Promise<unknown>>();
+
+function enqueueKernelMaintenance<T>(
+  kernel: KernelConnection,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = maintenanceQueues.get(kernel) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  maintenanceQueues.set(kernel, next);
+  return next;
+}
+
+/** Run a maintenance snippet and return its full textual output. */
+async function runKernelMaintenance(kernel: KernelConnection, code: string): Promise<string> {
+  return enqueueKernelMaintenance(kernel, async () => {
+    let out = '';
+    const outputs = await kernel.execute(code);
+    for await (const output of outputs) {
+      out += kernelOutputToText(output);
+      if (output.type === 'error') {
+        throw new Error(`${output.ename}: ${output.evalue}`);
+      }
+    }
+    return out;
+  });
+}
 
 /** ttyd protocol command bytes (binary frames, first byte is the cmd). */
 const TTYD_CMD_STDIN = 0x30;   // '0'
@@ -630,20 +668,24 @@ export function relaySendResize(relay: PtyRelay, cols: number, rows: number): vo
 
 /**
  * Kill the VM-side relay process tree for this shellId and remove its
- * script + log files. Retries with backoff — kernel exec is exactly the
- * channel that tends to fail during network disturbances ("Connection was
- * temporarily lost"), which is also when cleanup most often runs.
+ * script + log files. Serialized through the per-kernel maintenance queue
+ * (bursts can't congest the single exec channel), confirmed by requiring
+ * the snippet's final `v-clean relay=gone` status line, retried with
+ * backoff, and every attempt logged with its outcome. Returns true when
+ * the kill was positively confirmed.
  *
- * Process-tree kill: bash was spawned with setsid (pgid == its pid), so
- * killing the relay alone would orphan bash + any foreground job (observed:
- * 8/10 python trainers survived an EOF-driven teardown). We read the child
- * pid from the relay log and SIGKILL the whole process group.
+ * Process-tree kill: bash was spawned with setsid (pgid == its pid), but
+ * interactive bash puts each foreground job in its own process group —
+ * killing only the relay or only bash's pgrp orphans jobs like
+ * `sleep 600`. We read the child pid from the relay log and SIGKILL every
+ * process sharing bash's session id.
  */
-export async function killPtyRelay(kernel: KernelConnection, shellId: number): Promise<void> {
+export async function killPtyRelay(kernel: KernelConnection, shellId: number): Promise<boolean> {
   const scriptPath = `/tmp/pty_relay_${shellId}.py`;
   const logPath = `/tmp/pty_relay_${shellId}.log`;
   const killCode = [
     `import subprocess, os, re, signal`,
+    `session_killed = 0`,
     `try:`,
     `    log = open(${JSON.stringify(logPath)}).read()`,
     `    m = re.search(r'RELAY-UP child=(\\d+)', log)`,
@@ -656,67 +698,91 @@ export async function killPtyRelay(kernel: KernelConnection, shellId: number): P
     `            try:`,
     `                st = open('/proc/'+p+'/stat').read()`,
     `                if int(st[st.rfind(')')+2:].split()[3]) == pid:  # session id`,
-    `                    try: os.kill(int(p), signal.SIGKILL)`,
+    `                    try: os.kill(int(p), signal.SIGKILL); session_killed += 1`,
     `                    except (ProcessLookupError, PermissionError): pass`,
     `            except Exception: pass`,
     `        try: os.killpg(pid, signal.SIGKILL)  # pgid == bash pid (setsid)`,
     `        except (ProcessLookupError, PermissionError): pass`,
     `        try: os.kill(pid, signal.SIGKILL)`,
     `        except (ProcessLookupError, PermissionError): pass`,
-    `except Exception: pass`,
+    `except Exception as e:`,
+    `    print('session-scan-error', e)`,
     `subprocess.run(['pkill', '-f', ${JSON.stringify(scriptPath)}], timeout=3)`,
+    `# confirm: is the relay process actually gone?`,
+    `chk = subprocess.run(['pgrep', '-f', ${JSON.stringify(scriptPath)}], capture_output=True, text=True)`,
+    `alive = [l for l in chk.stdout.splitlines() if l.strip() and 'pgrep' not in l]`,
+    `files_removed = 0`,
     `for p in [${JSON.stringify(scriptPath)}, ${JSON.stringify(logPath)}]:`,
-    `    try: os.remove(p)`,
+    `    try: os.remove(p); files_removed += 1`,
     `    except Exception: pass`,
-    `print('v-clean')`,
+    `print(f'v-clean relay={"alive" if alive else "gone"} session_killed={session_killed} files_removed={files_removed}')`,
   ].join('\n');
 
   for (let attempt = 0; attempt < KILL_RELAY_ATTEMPTS; attempt++) {
+    const backoff = KILL_RELAY_BACKOFF_MS[Math.min(attempt, KILL_RELAY_BACKOFF_MS.length - 1)];
+    if (backoff > 0) await new Promise((r) => setTimeout(r, backoff));
     try {
-      const outputs = await kernel.execute(killCode);
-      for await (const _ of outputs) { /* drain */ }
-      return;
+      const out = await runKernelMaintenance(kernel, killCode);
+      if (out.includes('v-clean') && out.includes('relay=gone')) {
+        const summary = out.match(/v-clean[^\n]*/)?.[0] ?? 'v-clean';
+        log.info(`killPtyRelay ${shellId}: ok (attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS}) ${summary}`);
+        return true;
+      }
+      log.warn(
+        `killPtyRelay ${shellId}: attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS} exec ran but relay not confirmed gone. Output tail: ${out.slice(-300)}`,
+      );
     } catch (err) {
       log.warn(
-        `killPtyRelay ${shellId}: kernel exec failed (attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS}):`,
+        `killPtyRelay ${shellId}: exec failed (attempt ${attempt + 1}/${KILL_RELAY_ATTEMPTS}):`,
         err instanceof Error ? err.message : String(err),
       );
-      const backoff = KILL_RELAY_BACKOFF_MS[Math.min(attempt, KILL_RELAY_BACKOFF_MS.length - 1)];
-      if (backoff > 0) await new Promise((r) => setTimeout(r, backoff));
     }
   }
-  log.warn(`killPtyRelay ${shellId}: all ${KILL_RELAY_ATTEMPTS} attempts failed; VM-side process/files may linger`);
+  log.warn(`killPtyRelay ${shellId}: all ${KILL_RELAY_ATTEMPTS} attempts failed; relay/files may linger (backstop sweeper will retry)`);
+  return false;
 }
 
 /**
- * Startup sweep: kill any `pty_relay` processes on the VM that this daemon
- * doesn't track (orphans from a crashed daemon / failed killPtyRelay), and
- * remove their /tmp files. Best-effort; call once at daemon startup or
- * runtime (re)attach before any shell_open.
+ * Orphan sweep: kill every `pty_relay` process on the VM whose shellId is
+ * NOT in `liveShellIds` (orphans from a crashed daemon or a killPtyRelay
+ * that exhausted its retries), and remove their /tmp files. Relays on the
+ * live list are never touched. Serialized through the same maintenance
+ * queue so it can't congest the exec channel either.
  */
-export async function sweepOrphanRelays(kernel: KernelConnection): Promise<void> {
+export async function sweepOrphanRelays(
+  kernel: KernelConnection,
+  liveShellIds: number[] = [],
+): Promise<void> {
   const sweepCode = [
-    `import subprocess, glob, os`,
-    `subprocess.run(['pkill', '-f', '/tmp/pty_relay_'], timeout=5)`,
-    `removed = 0`,
-    `for p in glob.glob('/tmp/pty_relay_*.py') + glob.glob('/tmp/pty_relay_*.log'):`,
-    `    try: os.remove(p); removed += 1`,
-    `    except Exception: pass`,
-    `print(f'sweep removed={removed}')`,
+    `import subprocess, glob, os, re`,
+    `live = {${liveShellIds.join(',')}}`,
+    `killed = 0; removed = 0`,
+    `for path in glob.glob('/tmp/pty_relay_*.py'):`,
+    `    m = re.match(r'/tmp/pty_relay_(\\d+)\\.py$', path)`,
+    `    if not m: continue`,
+    `    sid = int(m.group(1))`,
+    `    if sid in live: continue`,
+    `    subprocess.run(['pkill', '-f', path], timeout=3)`,
+    `    killed += 1`,
+    `    for p in (path, path[:-3] + '.log'):`,
+    `        try: os.remove(p); removed += 1`,
+    `        except Exception: pass`,
+    `print(f'sweep killed={killed} removed={removed} live={${liveShellIds.length}}')`,
   ].join('\n');
   try {
-    const outputs = await kernel.execute(sweepCode);
-    for await (const _ of outputs) { /* drain */ }
+    const out = await runKernelMaintenance(kernel, sweepCode);
+    log.info(`sweepOrphanRelays: ${out.trim().split('\n').pop() ?? 'done'}`);
   } catch (err) {
-    log.warn('sweepOrphanRelays: kernel exec failed:', err instanceof Error ? err.message : String(err));
+    log.warn('sweepOrphanRelays: exec failed:', err instanceof Error ? err.message : String(err));
   }
 }
 
 /**
  * Tear everything down for a relay that's no longer needed: suppress the
  * reconnect path, close the WS, close the port-forward, dispose the buffer,
- * and sweep the VM-side process tree. All steps are best-effort — no error
- * here should mask the original cause that triggered the teardown.
+ * and kill the VM-side process tree. Errors are logged, never swallowed —
+ * a failed VM-side kill is visible in the daemon log and left to the
+ * backstop sweeper.
  */
 export async function closePtyRelay(relay: PtyRelay, kernel: KernelConnection): Promise<void> {
   relay.closing = true;
@@ -724,10 +790,17 @@ export async function closePtyRelay(relay: PtyRelay, kernel: KernelConnection): 
   relay.pendingInputBytes = 0;
   try { relay.ws.close(); } catch { /* ignore */ }
   try { await relay.forward.close(); } catch (err) {
-    log.debug(`closePtyRelay ${relay.shellId}: forward.close failed:`, err instanceof Error ? err.message : String(err));
+    log.warn(`closePtyRelay ${relay.shellId}: forward.close failed:`, err instanceof Error ? err.message : String(err));
   }
   try { relay.buffer.dispose(); } catch { /* ignore */ }
-  await killPtyRelay(kernel, relay.shellId).catch(() => {});
+  try {
+    const ok = await killPtyRelay(kernel, relay.shellId);
+    if (!ok) {
+      log.warn(`closePtyRelay ${relay.shellId}: VM-side kill not confirmed; backstop sweeper will retry`);
+    }
+  } catch (err) {
+    log.warn(`closePtyRelay ${relay.shellId}: killPtyRelay threw:`, err instanceof Error ? err.message : String(err));
+  }
 }
 
 // ── internal helpers ──
