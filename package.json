@@ -10,6 +10,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test test/*.test.mjs",
     "dev": "tsc --watch",
     "start": "node --use-env-proxy dist/index.js",
     "prepublishOnly": "npm run build"
