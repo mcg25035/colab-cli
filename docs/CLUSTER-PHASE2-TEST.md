@@ -339,6 +339,162 @@ kill $(cat ~/.config/colab-cli/cluster/cluster.pid) 2>/dev/null  # 備援
 
 全綠才算 Phase 2 可收；有紅的標出 expected/actual + 你猜的根因，別自己偷偷修。
 
+## Round 2 — 本輪 code 變更(2026-08-23 修 T6/T8 + adaptive upload)
+
+以下 code 全部被動過，**即使測過的 T# 也要重新跑**:
+
+| 檔案 | 變更 | 影響面 |
+|---|---|---|
+| `src/cluster/state.ts` | `updateJob` 加 terminal-state 守衛(done/failed/cancelled 不能被覆寫回 active) | 所有 cancel/failed 流程 |
+| `src/cluster/daemon.ts` | dispatch 完開 shell 後若偵測到已 cancelled → 立即 shellClose | T8 cancel-related |
+| `src/jupyter/contents-client.ts` | `putFileBase64` timeout 依 payload 縮放,或吃呼叫方傳入的 timeoutMs | **全部上傳**(含原生 `colab fs upload`) |
+| `src/transfer/common.ts` | `CHUNKED_MAX_BYTES` 500MiB → **8GiB**;`normalizeRemotePath` 認目錄式 dest(自動接 basename) | 大檔上傳(原本是硬擋)+ 所有 upload CLI 的 dest 處理 |
+| `src/transfer/upload.ts` | 新 `probeUplink`(1MiB) + `planForRate`:chunked 路徑動態決定 chunk size / 並行數 / timeout | **所有 chunked 上傳**(20MiB~8GiB) |
+| `src/cluster/upload.ts` | cluster 自動上傳拔掉固定 chunk 參數,換用 probe 自適應;dest 是目錄的處理改由底層接手 | job 的 uploads 流程 |
+
+### Round 2 新增測試
+
+---
+<!-- R2-ANCHOR -->
+
+### T11 — 原生 CLI `fs upload` chunked + 自適應(驗測速路徑)
+
+T6 修的不只是 cluster，底層 transfer 也動了。原生 CLI 也要驗。
+
+```bash
+dd if=/dev/urandom of=/tmp/t11.bin bs=1M count=100   # 100 MiB,確保走 chunked
+sha256sum /tmp/t11.bin | awk '{print $1}' > /tmp/t11.sha
+
+time node dist/index.js fs upload /tmp/t11.bin \
+  --account <email> -e <endpoint> --remote-path /content/t11/t11.bin
+
+node dist/index.js exec --account <email> -e <endpoint> \
+  'import hashlib; print(hashlib.sha256(open("/content/t11/t11.bin","rb").read()).hexdigest())'
+diff <(cat /tmp/t11.sha) <(上一步的印出)   # 必須一致
+```
+
+**驗重點**:
+- 上傳中`/content/.colab-transfer-tmp/` 先冒出 `__uplink_probe__.bin` 再消失（另開終端機瞟）
+- chunk 數量手機網 vs 固網會不同(自適應)— **都算正常**
+- sha256 一致
+
+---
+
+### T12 — 目錄式 dest(`--remote-path` 給資料夾,`uploads dest` 給資料夾)
+
+normalizeRemotePath 修改了，兩種 dest 型態都要過:
+
+```bash
+echo DIRTEST > /tmp/t12.txt
+
+# CLI 版本
+node dist/index.js fs upload /tmp/t12.txt --account <email> -e <endpoint> --remote-path /content/dirtest/
+# 預期: 上傳到 /content/dirtest/t12.txt(底層自動接 basename),不是 404
+
+# cluster job 版本
+cat > /tmp/t12-spec.json <<'EOF'
+{"name":"t12-dirdest","uploads":[{"src":"/tmp/t12.txt","dest":"/content/data/"}],"command":"ls -la /content/data/t12.txt"}
+EOF
+node dist/index.js cluster submit -f /tmp/t12-spec.json
+# 等 done 後 logs 應看到 /content/data/t12.txt 的 -rw-r--r-- 行
+```
+
+**驗重點**:**兩邊都要成功**。修前在 cluster 我們有 workaround 補basename,現在交給底層;CLI 沒有 workaround,底層修後才通。
+
+---
+
+### T13 — 大檔上限引擎:500MiB 過界 → 8GiB 放行的邏輯
+
+直接對 CLI 下，不傳(不想燒頻寬也可以 dry-run 行為測試—看 chooseStrategy 用 node -e 即可):
+
+```bash
+node --input-type=module -e "
+import { chooseStrategy } from './dist/transfer/common.js';
+console.log('600MiB →', chooseStrategy(600*1024*1024)); // 預期 chunked(以前會是 drive)
+console.log('9GiB   →', chooseStrategy(9*1024**3));      // 預期 drive(未實作,會報錯)
+console.log('200MiB →', chooseStrategy(200*1024*1024)); // 預期 chunked
+"
+```
+
+**驗重點**:600MiB 走 chunked。如果你想真的傳一個 600MiB 的檔確認沒被擋,在固網機器上做,手機網別試。
+
+---
+### T14 — T8 race 回歸(修後驗證)
+
+```bash
+# submit 後 0.3 秒內 cancel(手速要快,或用腳本)
+JID=$(node dist/index.js cluster submit -c 'sleep 9999' -n t14-race | grep -oP 'job \K\d+')
+sleep 0.3
+node dist/index.js cluster cancel $JID
+
+sleep 150
+node dist/index.js cluster list | tail -1
+# 預期：
+#  - status = cancelled(不再變成 running)
+#  - VM 上沒有 sleep 9999 殘留:
+node dist/index.js exec --account <a> -e <e> \
+  'import subprocess; print("STRAY" if subprocess.run(["pgrep","-f","sleep 9999"],capture_output=True).returncode==0 else "CLEAN")'
+# 預期: CLEAN
+```
+
+**驗重點**：這是 regression 測試；**不能**看到 list 變 running、不能看到 CLEAN 變 STRAY。
+
+---
+
+### T15 — cancel running job 仍然動(修 T8 不要弄壞 T8b)
+
+重跑 T8b 那組:
+
+```bash
+node dist/index.js cluster submit -c 'sleep 9999; echo SURVIVED' -n t15
+# 等 running
+node dist/index.js cluster cancel <id>
+# 預期: cancelled;exec pgrep 是 CLEAN;SURVIVED 沒被印
+```
+
+---
+
+### T16 — 連續 upload 一致性（probe 不會造成 race/殘留）
+
+連續 3 個 upload，每個 30MiB:
+
+```bash
+dd if=/dev/urandom of=/tmp/t16-1.bin bs=1M count=30
+dd if=/dev/urandom of=/tmp/t16-2.bin bs=1M count=30
+dd if=/dev/urandom of=/tmp/t16-3.bin bs=1M count=30
+
+for i in 1 2 3; do
+  time node dist/index.js fs upload /tmp/t16-$i.bin --account <a> -e <e> \
+    --remote-path /content/probe/t16-$i.bin
+done
+
+# 驗:VM 上 probe 檔殘留情況
+node dist/index.js exec --account <a> -e <e> \
+  'import os,glob; print([f for f in glob.glob("/content/.colab-transfer-tmp/__uplink_probe__*")])'
+# 預期: 0~1 個最新 probe 檔(不再增生),不會每次上傳多一個
+```
+
+---
+
+## Round 2 回歸（全部都要跑）
+
+| ID | 說明 |
+|---|---|
+| T1–T10 | **全部重跑**——尤其 T5(skip setup)、T8(cancel) 是這輪動到的核心 |
+| T11–T16 | 新增，見上 |
+
+## 收尾額外檢查（新增）
+
+```bash
+# 沒有任何 VM 殘留?
+node dist/index.js cluster status
+# 造成的 runtime 全 destroy
+node dist/index.js runtime list --account <每個帳號> | grep -v "No runtimes"
+
+# probe 檔不會在 VM 上堆?
+# (T16 已驗)
+```
+
 <!-- APPEND-ANCHOR -->
 
 
