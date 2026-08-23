@@ -5,6 +5,7 @@ import {
   clusterPool,
   jobLogs,
   listClusterJobs,
+  shutdownClusterDaemon,
   submitJob,
 } from '../cluster/client.js';
 import type { Job } from '../cluster/state.js';
@@ -151,4 +152,9 @@ export async function clusterLogsCommand(jobId: number, tail?: number): Promise<
 export async function clusterCancelCommand(jobId: number): Promise<void> {
   await cancelJob(jobId);
   console.log(`Job ${jobId} cancelled`);
+}
+
+export async function clusterShutdownCommand(): Promise<void> {
+  await shutdownClusterDaemon();
+  console.log('Cluster daemon stopped (state persisted; next `colab cluster` command respawns it)');
 }

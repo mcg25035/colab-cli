@@ -54,6 +54,7 @@ import {
   clusterListCommand,
   clusterLogsCommand,
   clusterCancelCommand,
+  clusterShutdownCommand,
   submitFromSpecCommand,
   clusterRehearseCommand,
 } from './commands/cluster.js';
@@ -695,6 +696,14 @@ clusterCmd
     }
     if (!opts.cmd) throw new Error('Either --cmd or --file is required');
     await clusterSubmitCommand(opts.cmd, { name: opts.name, accelerator: opts.accelerator });
+  });
+
+clusterCmd
+  .command('shutdown')
+  .description('shut down the cluster daemon (jobs persist and resume after next connect)')
+  .action(async () => {
+    await ensureLoggedIn();
+    await clusterShutdownCommand();
   });
 
 clusterCmd
