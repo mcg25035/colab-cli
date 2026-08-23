@@ -158,6 +158,10 @@ export interface DeployPtyRelayOpts {
   shellId: number;
   cols: number;
   rows: number;
+  /** Optional argv for the relay's child process (default: relay-internal
+   *  `['bash']`). Cluster jobs pass `bash -c <cmd>` so the shell closes when
+   *  the command finishes. */
+  argv?: string[];
   kernel: KernelConnection;
   kernelReady: Promise<void>;
   colabClient: ColabClient;
@@ -358,12 +362,14 @@ export async function deployPtyRelay(opts: DeployPtyRelayOpts): Promise<PtyRelay
 
   // 1. write the relay script + launch on the VM
   const pyB64 = Buffer.from(PTY_RELAY_PY, 'utf8').toString('base64');
+  const argvPy = (opts.argv ?? []).map((a) => `, ${JSON.stringify(a)}`).join('');
   const launchCode = [
-    `import base64, os, subprocess, time`,
+    `import base64, os, shlex, subprocess, time`,
     `open(${JSON.stringify(scriptPath)}, 'w').write(base64.b64decode(${JSON.stringify(pyB64)}).decode())`,
     `subprocess.run(['pkill','-f', ${JSON.stringify(scriptPath)}], timeout=3)`,
     `time.sleep(0.3)`,
-    `subprocess.Popen(['bash','-c','nohup python3 ' + ${JSON.stringify(scriptPath + ' ' + String(port) + ' ' + String(cols) + ' ' + String(rows))} + ' > ' + ${JSON.stringify(logPath)} + ' 2>&1 &'], start_new_session=True)`,
+    `argv = [${JSON.stringify(scriptPath)}, ${JSON.stringify(String(port))}, ${JSON.stringify(String(cols))}, ${JSON.stringify(String(rows))}${argvPy}]`,
+    `subprocess.Popen(['bash','-c','nohup python3 ' + shlex.join(argv) + ' > ' + ${JSON.stringify(logPath)} + ' 2>&1 &'], start_new_session=True)`,
     `deadline = time.time() + ${SHELL_RELAY_BOOTSTRAP_TIMEOUT_MS / 1000}`,
     `while time.time() < deadline:`,
     `    time.sleep(${SHELL_RELAY_BOOTSTRAP_POLL_INTERVAL_MS / 1000})`,

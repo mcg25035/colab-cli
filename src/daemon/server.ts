@@ -891,6 +891,7 @@ function handleClient(
             shellId,
             cols,
             rows,
+            argv: msg.argv,
             kernel,
             kernelReady,
             colabClient,
