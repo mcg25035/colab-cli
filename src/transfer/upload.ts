@@ -73,12 +73,16 @@ async function uploadBase64Blob(
   base64Content: string,
   expectedSize: number,
   retries: number,
+  timeoutMsFor?: (b64Len: number) => number,
 ): Promise<void> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       await ensureRemoteParents(conn, remotePath);
-      await putFileBase64(conn.getProxyUrl(), conn.getToken(), remotePath, base64Content);
+      await putFileBase64(
+        conn.getProxyUrl(), conn.getToken(), remotePath, base64Content,
+        timeoutMsFor?.(base64Content.length),
+      );
       await verifyUploadedFile(conn, remotePath, expectedSize);
       return;
     } catch (err) {
@@ -159,13 +163,12 @@ async function uploadChunked(
   remotePath: string,
   fileSize: number,
   retries: number,
-  chunkSizeBytes: number,
-  maxConcurrency: number,
+  chunkSizeBytesOpt: number | undefined,
+  maxConcurrencyOpt: number | undefined,
   execOnKernel: (code: string) => Promise<string>,
   onProgress?: (event: UploadProgressEvent) => void,
 ): Promise<UploadResult> {
   const transferId = createTransferId('upload');
-  const chunks = buildChunkPlan(fileSize, chunkSizeBytes);
   const tmpDir = `${TMP_ROOT}/${transferId}`;
   const partsDir = `${tmpDir}/parts`;
   const manifestPath = `${tmpDir}/manifest.json`;
@@ -179,10 +182,22 @@ async function uploadChunked(
     await ensureRemoteDirectory(conn, partsDir);
     await ensureRemoteParents(conn, remotePath);
 
+    // Adaptive plan: probe uplink AFTER tmp dirs exist (the probe PUT
+    // targets TMP_ROOT), explicit caller overrides win.
+    let plan: AdaptivePlan | undefined;
+    if (chunkSizeBytesOpt === undefined) {
+      plan = planForRate(await probeUplink(conn));
+    }
+    const chunkSizeBytes = chunkSizeBytesOpt ?? plan!.chunkSizeBytes;
+    const maxConcurrency = Math.min(maxConcurrencyOpt ?? plan!.maxConcurrency, DEFAULT_MAX_CONCURRENCY);
+    const timeoutMsFor = plan?.timeoutMsFor;
+
+    const chunks = buildChunkPlan(fileSize, chunkSizeBytes);
+
     let uploadedCount = 0;
     await runPool(chunks, maxConcurrency, async (chunk) => {
       const base64 = readChunkAsBase64(fd, chunk.offset, chunk.size);
-      await uploadBase64Blob(conn, `${partsDir}/${chunk.filename}`, base64, chunk.size, retries);
+      await uploadBase64Blob(conn, `${partsDir}/${chunk.filename}`, base64, chunk.size, retries, timeoutMsFor);
       uploadedCount++;
       onProgress?.({ type: 'chunk-progress', uploaded: uploadedCount, total: chunks.length });
     });
@@ -221,7 +236,53 @@ async function uploadChunked(
   }
 }
 
-// --- Main entry point ---
+// --- Adaptive uplink probing ---
+// One 1 MiB probe PUT measures wire throughput; the chunked upload then
+// scales chunk size, lane count and per-PUT timeout to fit. On fat pipes
+// this picks big chunks + many lanes; on thin/mobile links it picks small
+// chunks + generous timeouts instead of melting at a fixed 120s cap.
+
+const PROBE_BYTES = 1 * 1024 * 1024; // 1 MiB payload (~1.4MB base64 on the wire)
+
+/** Returns wire throughput in base64-bytes/sec. NaN-safe, never throws. */
+async function probeUplink(conn: ConnectionProvider): Promise<number | undefined> {
+  try {
+    const payload = Buffer.alloc(PROBE_BYTES, 0x61).toString('base64');
+    const t0 = Date.now();
+    await putFileBase64(conn.getProxyUrl(), conn.getToken(), `${TMP_ROOT}/__uplink_probe__.bin`, payload);
+    const secs = Math.max(0.001, (Date.now() - t0) / 1000);
+    return payload.length / secs;
+  } catch {
+    return undefined; // probing is advisory; a failed probe just means "stay conservative"
+  }
+}
+
+interface AdaptivePlan {
+  chunkSizeBytes: number;
+  maxConcurrency: number;
+  /** payload-size-aware per-PUT timeout based on the measured rate */
+  timeoutMsFor: (b64Len: number) => number;
+}
+
+function planForRate(bytesPerSec: number | undefined): AdaptivePlan {
+  let chunkMiB: number, lanes: number;
+  if (bytesPerSec === undefined || bytesPerSec < 128 * 1024) {
+    chunkMiB = 4; lanes = 3;        // mobile/thin: small chunks, few lanes
+  } else if (bytesPerSec < 1500 * 1024) {
+    chunkMiB = 8; lanes = 6;        // average broadband
+  } else {
+    chunkMiB = 16; lanes = 12;      // fat pipe: lean into it
+  }
+  const chunkSizeBytes = chunkMiB * 1024 * 1024;
+  const timeoutMsFor = (b64Len: number): number => {
+    if (bytesPerSec === undefined) {
+      return Math.max(120_000, Math.ceil(b64Len / 64) * 1000 + 60_000); // 64KB/s floor
+    }
+    // 3x the expected transfer time + 60s; never below 2 minutes
+    return Math.max(120_000, Math.ceil((b64Len / bytesPerSec) * 3) * 1000 + 60_000);
+  };
+  return { chunkSizeBytes, maxConcurrency: lanes, timeoutMsFor };
+}
 
 export async function uploadFile(
   conn: ConnectionProvider,
@@ -241,7 +302,7 @@ export async function uploadFile(
 
   if (strategy === 'drive') {
     throw new Error(
-      `File size ${stat.size} bytes exceeds chunked limit of ${CHUNKED_MAX_BYTES} bytes (500 MiB). Google Drive upload is not yet implemented.`,
+      `File size ${stat.size} bytes exceeds chunked limit of ${CHUNKED_MAX_BYTES} bytes (8 GiB). Split the file locally or wait for Google Drive upload support.`,
     );
   }
 
@@ -249,10 +310,12 @@ export async function uploadFile(
     return uploadDirect(conn, resolvedLocalPath, remotePath, stat.size, retries, onProgress);
   }
 
+  // Explicit caller overrides win; otherwise probe the uplink inside
+  // uploadChunked (after dirs exist) and adapt chunk size / lanes / timeout.
   return uploadChunked(
     conn, resolvedLocalPath, remotePath, stat.size, retries,
-    options.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES,
-    Math.min(options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY, DEFAULT_MAX_CONCURRENCY),
+    options.chunkSizeBytes,
+    options.maxConcurrency,
     execOnKernel, onProgress,
   );
 }

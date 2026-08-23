@@ -84,11 +84,13 @@ export async function putFileBase64(
   token: string,
   remotePath: string,
   base64Content: string,
+  timeoutMs?: number,
 ): Promise<any> {
-  // Timeout must scale with payload: the default 120s cap is only enough
-  // for a few MiB on thin uplinks (~64 KB/s floor assumed, +60s headroom),
-  // otherwise every chunked upload attempt burns the same 120s and fails.
-  const timeoutMs = Math.max(120_000, Math.ceil(base64Content.length / 64) * 1000 + 60_000);
+  // Timeout scales with payload when the caller hasn't probed the uplink:
+  // 64 KB/s conservative floor + 60s headroom. Probed callers pass an
+  // adaptive timeoutMs instead.
+  const effectiveTimeout =
+    timeoutMs ?? Math.max(120_000, Math.ceil(base64Content.length / 64) * 1000 + 60_000);
   return contentsRequest(proxyUrl, token, encodeContentsPath(remotePath), {
     method: 'PUT',
     body: {
@@ -96,7 +98,7 @@ export async function putFileBase64(
       format: 'base64',
       content: base64Content,
     },
-    timeoutMs,
+    timeoutMs: effectiveTimeout,
   });
 }
 

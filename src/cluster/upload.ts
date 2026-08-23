@@ -50,18 +50,10 @@ export async function clusterUpload(
   }
   const result = await uploadFile(
     makeConnectionProvider(server),
-    // Cluster uploads run unattended on whatever uplink the user has:
-    // base64 inflates a 20MiB chunk to ~27MiB and 25-way parallel PUTs
-    // saturate slow links until the contents API's 120s timeout fires (T6).
-    // Smaller chunks + fewer lanes + one extra retry is slower on a fat pipe
-    // but actually finishes on a thin one.
-    {
-      localPath: resolved,
-      remotePath: dest,
-      chunkSizeBytes: 5 * 1024 * 1024,
-      maxConcurrency: 5,
-      retries: 4,
-    },
+    // No chunk/concurrency overrides: the chunked path probes the uplink
+    // (1 MiB) and picks chunk size / lanes / per-PUT timeout to fit —
+    // conservative on mobile links, aggressive on fat pipes.
+    { localPath: resolved, remotePath: dest },
     makeDaemonExec(client),
   );
   if (!result.ok) {

@@ -7,7 +7,7 @@ import {
 // --- Constants ---
 
 export const DIRECT_LIMIT_BYTES = 20 * 1024 * 1024;
-export const CHUNKED_MAX_BYTES = 500 * 1024 * 1024;
+export const CHUNKED_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB — chunked with adaptive pacing handles it
 export const DEFAULT_CHUNK_SIZE_BYTES = 20 * 1024 * 1024;
 export const DEFAULT_MAX_CONCURRENCY = 25;
 export const DEFAULT_RETRIES = 3;
@@ -42,6 +42,12 @@ export function normalizeRemotePath(remotePath: string, fallbackBasename?: strin
   if (!value) throw new Error('Remote path cannot be empty');
   value = value.replace(/\\/g, '/').replace(/^\/+/, '');
   if (!value) throw new Error('Remote path cannot be empty');
+  // Directory-dest convenience: a trailing slash means "put it under this
+  // folder with its local basename" (used to slip through and 404 at verify).
+  if (value.endsWith('/')) {
+    if (!fallbackBasename) throw new Error('Directory-style remote path requires a filename');
+    value = value + fallbackBasename;
+  }
   if (!value.startsWith('content/')) value = `content/${value}`;
   return value;
 }
