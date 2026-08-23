@@ -49,6 +49,15 @@ import {
   shellCloseCommand,
 } from './commands/shell.js';
 import {
+  clusterStatusCommand,
+  clusterSubmitCommand,
+  clusterListCommand,
+  clusterLogsCommand,
+  clusterCancelCommand,
+  submitFromSpecCommand,
+  clusterRehearseCommand,
+} from './commands/cluster.js';
+import {
   portForwardCreateCommand,
   portForwardListCommand,
   portForwardCloseCommand,
@@ -658,9 +667,72 @@ shellCmd
     await shellCloseCommand(getActive().runtime.getAccountId(), parseInt(id, 10));
   });
 
+// ── Cluster scheduler commands ──
+const clusterCmd = program
+  .command('cluster')
+  .description('cluster job scheduler (submit commands to idle VMs across all accounts)');
+
+clusterCmd
+  .command('status')
+  .description('show account/VM pool overview and queue summary')
+  .action(async () => {
+    await ensureLoggedIn();
+    await clusterStatusCommand();
+  });
+
+clusterCmd
+  .command('submit')
+  .description('submit a cluster job (either -c inline command, or -f a job spec JSON with setup_file/uploads/command)')
+  .option('-c, --cmd <cmd>', 'shell command to run on the assigned VM (quote it!)')
+  .option('-f, --file <file>', 'job spec JSON: {name?, accelerator?, setup_file?, uploads?, command}')
+  .option('-n, --name <name>', 'job name')
+  .option('-a, --accelerator <accelerator>', 'request accelerator for a newly provisioned runtime (CPU, L4, T4, ...)')
+  .action(async (opts) => {
+    await ensureLoggedIn();
+    if (opts.file) {
+      await submitFromSpecCommand(opts.file);
+      return;
+    }
+    if (!opts.cmd) throw new Error('Either --cmd or --file is required');
+    await clusterSubmitCommand(opts.cmd, { name: opts.name, accelerator: opts.accelerator });
+  });
+
+clusterCmd
+  .command('rehearse <setupFile>')
+  .description('validate a setup script on ONE VM (agent bring-up loop): runs setup only, keeps VM idle after; repeat until green')
+  .option('-n, --name <name>', 'job name')
+  .action(async (setupFile: string, opts) => {
+    await ensureLoggedIn();
+    await clusterRehearseCommand(setupFile, opts.name);
+  });
+
+clusterCmd
+  .command('list')
+  .description('list cluster jobs')
+  .action(async () => {
+    await ensureLoggedIn();
+    await clusterListCommand();
+  });
+
+clusterCmd
+  .command('logs <jobId>')
+  .description('show output snapshot/tail for a job')
+  .option('--tail <n>', 'last N lines', parseInt)
+  .action(async (jobId: string, opts) => {
+    await ensureLoggedIn();
+    await clusterLogsCommand(parseInt(jobId, 10), opts.tail);
+  });
+
+clusterCmd
+  .command('cancel <jobId>')
+  .description('cancel a queued job or kill a running job (kills its whole VM-side process tree)')
+  .action(async (jobId: string) => {
+    await ensureLoggedIn();
+    await clusterCancelCommand(parseInt(jobId, 10));
+  });
+
 // Port forwarding commands
-const portForward = program
-  .command('port-forward')
+const portForward = program  .command('port-forward')
   .alias('pf')
   .description('forward a runtime port to a local bind address (HTTP/WebSocket)');
 

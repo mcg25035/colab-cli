@@ -188,8 +188,14 @@ export class DaemonClient {
 
   // ── Shell session methods ──
 
-  async shellOpen(cols: number, rows: number, shellId?: number): Promise<number> {
-    this.send({ type: 'shell_open', cols, rows, ...(shellId !== undefined ? { shellId } : {}) });
+  async shellOpen(cols: number, rows: number, shellId?: number, argv?: string[]): Promise<number> {
+    this.send({
+      type: 'shell_open',
+      cols,
+      rows,
+      ...(shellId !== undefined ? { shellId } : {}),
+      ...(argv ? { argv } : {}),
+    });
     const msg = await this.nextMessage();
     if (msg.type === 'shell_opened') return msg.shellId;
     if (msg.type === 'shell_error') throw new Error(msg.message);
