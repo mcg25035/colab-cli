@@ -43,9 +43,25 @@ export async function clusterUpload(
 ): Promise<void> {
   const resolved = path.resolve(src);
   if (!fs.existsSync(resolved)) throw new Error(`upload src not found: ${resolved}`);
+  // `normalizeRemotePath` doesn't treat a trailing-slash dest as a
+  // directory (the verify step then 404s); resolve the filename ourselves.
+  if (dest.endsWith('/')) {
+    dest = dest + path.basename(resolved);
+  }
   const result = await uploadFile(
     makeConnectionProvider(server),
-    { localPath: resolved, remotePath: dest },
+    // Cluster uploads run unattended on whatever uplink the user has:
+    // base64 inflates a 20MiB chunk to ~27MiB and 25-way parallel PUTs
+    // saturate slow links until the contents API's 120s timeout fires (T6).
+    // Smaller chunks + fewer lanes + one extra retry is slower on a fat pipe
+    // but actually finishes on a thin one.
+    {
+      localPath: resolved,
+      remotePath: dest,
+      chunkSizeBytes: 5 * 1024 * 1024,
+      maxConcurrency: 5,
+      retries: 4,
+    },
     makeDaemonExec(client),
   );
   if (!result.ok) {

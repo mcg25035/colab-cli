@@ -111,6 +111,16 @@ export function updateJob(id: number, patch: Partial<Job>): Job | undefined {
   const st = readClusterState();
   const job = st.jobs.find((x) => x.id === id);
   if (!job) return undefined;
+  // Terminal states are final: a stale dispatcher snapshot (taken before a
+  // cancel/failure landed) must never resurrect the job. T8 race fix.
+  const terminal: JobStatus[] = ['done', 'failed', 'cancelled'];
+  if (
+    terminal.includes(job.status) &&
+    patch.status !== undefined &&
+    !terminal.includes(patch.status)
+  ) {
+    return job; // refuse the resurrection; ignore patch
+  }
   Object.assign(job, patch);
   writeClusterState(st);
   return job;

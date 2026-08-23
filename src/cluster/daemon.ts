@@ -273,7 +273,11 @@ async function dispatchQueuedJobs(): Promise<void> {
         await drainExec(client, `import base64; open(${JSON.stringify(scriptPath)},'w').write(base64.b64decode(${JSON.stringify(b64)}).decode())`);
         const shellId = await client.shellOpen(120, 30);
         client.shellInput(shellId, `bash ${scriptPath}\nexit\n`);
-        updateJob(job.id, {
+        // Race guard (T8): the user may have cancelled while we were
+        // uploading/deploying. State refuses the running resurrection via
+        // updateJob's terminal-state guard; here we detect that refusal and
+        // kill the just-opened shell so no orphaned process survives.
+        const applied = updateJob(job.id, {
           status: 'running',
           accountId: target.accountId,
           serverId: target.server.id,
@@ -282,6 +286,11 @@ async function dispatchQueuedJobs(): Promise<void> {
           startedAt: new Date().toISOString(),
           error: undefined,
         });
+        if (applied && applied.status === 'cancelled') {
+          clog(`job ${job.id} was cancelled mid-dispatch; killing shell ${shellId}`);
+          await client.shellClose(shellId).catch(() => {});
+          return;
+        }
         clog(`job ${job.id} running on ${target.accountId} ${target.server.endpoint} shell ${shellId}`);
         dispatchAttempts.delete(job.id);
         // mark the VM busy within this tick's pool so a second queued job
