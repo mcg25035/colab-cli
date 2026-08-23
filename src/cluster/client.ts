@@ -78,7 +78,14 @@ export async function submitJob(
   command: string,
   name?: string,
   accelerator?: string,
-  extra?: { setupScript?: string; uploads?: Array<{ src: string; dest: string }>; rehearse?: boolean },
+  extra?: {
+    setupScript?: string;
+    uploads?: Array<{ src: string; dest: string }>;
+    rehearse?: boolean;
+    progressPattern?: string;
+    ckptGlob?: string;
+    ckptKeep?: number;
+  },
 ): Promise<Job> {
   const res = await clusterRequest<{ job: Job }>({ type: 'submit', command, name, accelerator, ...extra });
   return res.job;

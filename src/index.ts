@@ -55,6 +55,7 @@ import {
   clusterLogsCommand,
   clusterCancelCommand,
   clusterShutdownCommand,
+  clusterCkptsCommand,
   submitFromSpecCommand,
   clusterRehearseCommand,
 } from './commands/cluster.js';
@@ -685,7 +686,7 @@ clusterCmd
   .command('submit')
   .description('submit a cluster job (either -c inline command, or -f a job spec JSON with setup_file/uploads/command)')
   .option('-c, --cmd <cmd>', 'shell command to run on the assigned VM (quote it!)')
-  .option('-f, --file <file>', 'job spec JSON: {name?, accelerator?, setup_file?, uploads?, command}')
+  .option('-f, --file <file>', 'job spec JSON: {name?, accelerator?, setup_file?, uploads?, progress_pattern?, ckpt_glob?, ckpt_keep?, command}')
   .option('-n, --name <name>', 'job name')
   .option('-a, --accelerator <accelerator>', 'request accelerator for a newly provisioned runtime (CPU, L4, T4, ...)')
   .action(async (opts) => {
@@ -738,6 +739,14 @@ clusterCmd
   .action(async (jobId: string) => {
     await ensureLoggedIn();
     await clusterCancelCommand(parseInt(jobId, 10));
+  });
+
+clusterCmd
+  .command('ckpts <jobId>')
+  .description('list a job\'s mirrored checkpoints (local copies that survive VM loss)')
+  .action(async (jobId: string) => {
+    await ensureLoggedIn();
+    await clusterCkptsCommand(parseInt(jobId, 10));
   });
 
 // Port forwarding commands

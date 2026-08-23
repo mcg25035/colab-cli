@@ -28,6 +28,9 @@ import {
 } from './state.js';
 import { pickIdleVm, snapshotPool } from './pool.js';
 import { clusterUpload } from './upload.js';
+import { extractProgress } from './progress-watcher.js';
+import { scanAndFetchCkpts, shouldScanNow } from './checkpoint-manager.js';
+import { getStoredServer } from '../runtime/storage.js';
 
 /**
  * Cluster scheduler daemon: one long-lived local process spanning ALL
@@ -127,6 +130,30 @@ async function mirrorJobLog(job: Job, client: DaemonClient, tailLines: number): 
 
 // ── dispatcher ──
 
+/** Run progress + checkpoint observation for a live job off an already-open
+ *  daemon client. Failures here must never disturb the job — degrade quietly. */
+async function observeJob(job: Job, client: DaemonClient, logTail: string, forceCkptScan = false): Promise<void> {
+  if (job.progressPattern) {
+    const p = extractProgress(logTail, job.progressPattern);
+    if (p !== undefined && p !== job.progress) {
+      updateJob(job.id, { progress: p });
+      job.progress = p;
+    }
+  }
+  if (job.ckptGlob && shouldScanNow(job.id, forceCkptScan)) {
+    const server =
+      job.accountId && job.serverId ? getStoredServer(job.accountId, job.serverId) : undefined;
+    if (server) {
+      try {
+        const n = await scanAndFetchCkpts(job, client, server, clog);
+        if (n > 0) clog(`job ${job.id}: ${n} ckpt file(s) mirrored locally`);
+      } catch (err) {
+        clog(`job ${job.id}: ckpt scan failed (will retry): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+}
+
 async function pollRunningJobs(): Promise<void> {
   for (const job of readClusterState().jobs.filter((j) => j.status === 'running')) {
     try {
@@ -141,6 +168,9 @@ async function pollRunningJobs(): Promise<void> {
           try {
             tail = await mirrorJobLog(job, client, FINAL_TAIL_LINES);
           } catch { /* retention already evicted it — the periodic mirrors stand */ }
+          // One last forced ckpt pull so a late-written checkpoint isn't
+          // stranded on a runtime that's about to be released.
+          await observeJob(job, client, tail, true);
           if (job.endpoint && tail.includes(SETUP_OK_MARK)) {
             markVmSetup(job.endpoint, job.accountId!, setupHash(job.setupScript ?? ''));
           }
@@ -159,7 +189,8 @@ async function pollRunningJobs(): Promise<void> {
           });
           clog(`job ${job.id} ${succeeded ? 'done' : 'failed'} (shell ${job.shellId} closed)`);
         } else {
-          await mirrorJobLog(job, client, MIRROR_TAIL_LINES).catch(() => {});
+          const buf = await mirrorJobLog(job, client, MIRROR_TAIL_LINES).catch(() => '');
+          await observeJob(job, client, buf);
         }
       } finally {
         client.close();
@@ -331,7 +362,8 @@ async function dispatchQueuedJobs(): Promise<void> {
 type Request =
   | { type: 'ping' }
   | { type: 'submit'; command: string; name?: string; accelerator?: string;
-      setupScript?: string; uploads?: Array<{ src: string; dest: string }>; rehearse?: boolean }
+      setupScript?: string; uploads?: Array<{ src: string; dest: string }>; rehearse?: boolean;
+      progressPattern?: string; ckptGlob?: string; ckptKeep?: number }
   | { type: 'list' }
   | { type: 'logs'; jobId: number; tail?: number }
   | { type: 'cancel'; jobId: number }
@@ -360,8 +392,13 @@ async function handleRequest(msg: Request): Promise<Response> {
         setupScript: msg.setupScript,
         uploads: msg.uploads,
         rehearse: msg.rehearse,
+        progressPattern: msg.progressPattern,
+        ckptGlob: msg.ckptGlob,
+        ckptKeep: msg.ckptKeep,
       });
-      clog(`job ${job.id} submitted${job.rehearse ? ' (rehearse)' : ''}: ${msg.command.slice(0, 80)}`);
+      clog(`job ${job.id} submitted${job.rehearse ? ' (rehearse)' : ''}: ${msg.command.slice(0, 80)}` +
+        `${msg.progressPattern ? ' progress=' + JSON.stringify(msg.progressPattern) : ''}` +
+        `${msg.ckptGlob ? ' ckpts=' + msg.ckptGlob : ''}`);
       void dispatchSoon();
       return { type: 'submitted', job };
     }
