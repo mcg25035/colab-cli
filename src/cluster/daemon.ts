@@ -50,6 +50,12 @@ let provisionRound = 0;
 /** Consecutive transient dispatch failures per job (resets on success). */
 const dispatchAttempts = new Map<number, number>();
 const MAX_DISPATCH_ATTEMPTS = 5;
+/** VMs that just ate a dispatch failure — fenced off for a few minutes so the
+ *  dispatcher falls back to another idle VM (or provisions a fresh one)
+ *  instead of slamming the same dead end 5 times and failing the job (T35). */
+const badVmUntil = new Map<string, number>();
+const BAD_VM_MS = 5 * 60_000;
+const vmKey = (accountId: string, endpoint: string) => `${accountId}:${endpoint}`;
 
 if (process.env.COLAB_CLUSTER_DAEMON !== '1') {
   console.error('cluster daemon must be spawned by the CLI (sets COLAB_CLUSTER_DAEMON=1)');
@@ -270,6 +276,20 @@ async function dispatchQueuedJobs(): Promise<void> {
 
   for (const job of queued) {
     let target = await pickIdleVm(pool);
+    // Fence recently-dead VMs out of this tick's pick.
+    const now0 = Date.now();
+    if (target && (badVmUntil.get(vmKey(target.accountId, target.server.endpoint)) ?? 0) > now0) {
+      target = undefined;
+      for (const acct of pool.accounts) {
+        for (const vm of acct.vms) {
+          if (!vm.daemonAlive || vm.jobIds.length > 0) continue;
+          if ((badVmUntil.get(vmKey(acct.accountId, vm.server.endpoint)) ?? 0) > now0) continue;
+          target = { accountId: acct.accountId, server: vm.server };
+          break;
+        }
+        if (target) break;
+      }
+    }
     if (!target) {
       // No idle VM in the whole pool — provision one. Rotate the starting
       // account each tick (a stable sort would otherwise retry the same
@@ -418,9 +438,10 @@ async function dispatchQueuedJobs(): Promise<void> {
       const transient = /connect|ECONNREFUSED|socket|WS open|404/i.test(emsg);
       const attempts = (dispatchAttempts.get(job.id) ?? 0) + 1;
       if (transient && attempts < MAX_DISPATCH_ATTEMPTS) {
+        badVmUntil.set(vmKey(target.accountId, target.server.endpoint), Date.now() + BAD_VM_MS);
         dispatchAttempts.set(job.id, attempts);
         updateJob(job.id, { status: 'queued', error: `dispatch attempt ${attempts} failed: ${emsg}` });
-        clog(`job ${job.id} dispatch attempt ${attempts} failed, requeued: ${emsg}`);
+        clog(`job ${job.id} dispatch attempt ${attempts} failed, requeued (fencing ${target.server.endpoint} for ${BAD_VM_MS / 60000}min): ${emsg}`);
       } else {
         dispatchAttempts.delete(job.id);
         updateJob(job.id, {
