@@ -155,12 +155,27 @@ async def wait_child():
     print(f"CHILD-EXIT rc={rc}", flush=True)
 
 
+# Close code 4000 = "the child process exited" (an intentional end-of-life,
+# NOT a transport failure). The daemon skips its 120s reconnect window on
+# seeing this — otherwise every finished job looks 'reconnecting' for two
+# minutes before being marked closed.
+CHILD_EXIT_CODE = 4000
+
+
 async def main():
     pump_task = asyncio.create_task(pump_pty_to_clients())
     wait_task = asyncio.create_task(wait_child())
     async with websockets.serve(handler, '0.0.0.0', PORT):
         print(f"WS-UP :{PORT}", flush=True)
-        await asyncio.wait({pump_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait({pump_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
+        # bash exit surfaces as EITHER wait_task finishing or the PTY hitting
+        # EOF (pump_task) first — cover both orderings, and fall back to
+        # child.poll() for the race window between the two.
+        if wait_task in done or child.poll() is not None:
+            # Child exited: tell every client explicitly before we tear down.
+            for c in list(clients):
+                try: await c.close(code=CHILD_EXIT_CODE, reason="child-exited")
+                except Exception: pass
         print("SHUTDOWN", flush=True)
     try:
         if child.poll() is None:
