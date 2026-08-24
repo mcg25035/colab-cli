@@ -905,6 +905,14 @@ function handleClient(
                 }
               },
               onClose: (code, reason) => {
+                // 4000 = relay telling us its child process exited (job done,
+                // user typed `exit`, …) — intentional end-of-life, NOT a
+                // transport failure. Skip the 120s reconnect window or every
+                // finished job would linger as 'reconnecting' for 2 minutes.
+                if (code === 4000) {
+                  markShellClosed(shellId, `process exited${reason ? ` (${reason})` : ''}`);
+                  return;
+                }
                 // Transport-level close (proxy hiccup, forward socket
                 // destroyed, heartbeat timeout terminate). The relay process
                 // on the VM is almost certainly still alive with bash +
