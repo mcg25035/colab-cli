@@ -85,6 +85,8 @@ export async function submitJob(
     progressPattern?: string;
     ckptGlob?: string;
     ckptKeep?: number;
+    allowRecover?: boolean;
+    maxRecoveries?: number;
   },
 ): Promise<Job> {
   const res = await clusterRequest<{ job: Job }>({ type: 'submit', command, name, accelerator, ...extra });

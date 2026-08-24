@@ -86,6 +86,18 @@ export interface Job {
   ckptHistory?: Record<string, number>;
   /** Local path of the most recent ckpt (Phase 4 resume input). */
   lastCkpt?: string;
+  /** Phase 4: false disables auto-recovery from reclaimed/lost runtimes. Default true. */
+  allowRecover?: boolean;
+  /** Phase 4: max auto-recoveries before the job fails for good. Default 3. */
+  maxRecoveries?: number;
+  /** Phase 4: how many times this job has been auto-recovered so far. */
+  recoveries?: number;
+  /** Phase 4: true while a recovered job waits for redispatch; the runner then
+   *  re-uploads lastCkpt and injects CLUSTER_RESUME env vars before re-running
+   *  the command. */
+  recoverPending?: boolean;
+  /** Phase 4: ISO time of the most recent recovery requeue. */
+  lastRecoveredAt?: string;
   status: JobStatus;
   /** Assignment (set once running). */
   accountId?: string;

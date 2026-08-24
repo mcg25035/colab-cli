@@ -28,6 +28,10 @@ interface JobSpecFile {
   ckpt_glob?: string;
   /** How many local ckpt copies to keep (oldest pruned). Default 3. */
   ckpt_keep?: number;
+  /** Phase 4: set false to fail instead of auto-recovering a reclaimed VM. */
+  allow_recover?: boolean;
+  /** Phase 4: max auto-recoveries before permanent failure. Default 3. */
+  max_recoveries?: number;
 }
 
 export function loadJobSpec(file: string): JobSpecFile {
@@ -66,6 +70,8 @@ export async function submitFromSpecCommand(specFile: string): Promise<void> {
     progressPattern: spec.progress_pattern,
     ckptGlob: spec.ckpt_glob,
     ckptKeep: spec.ckpt_keep,
+    allowRecover: spec.allow_recover,
+    maxRecoveries: spec.max_recoveries,
   });
 }
 
@@ -124,6 +130,8 @@ export async function clusterSubmitCommand(
     progressPattern?: string;
     ckptGlob?: string;
     ckptKeep?: number;
+    allowRecover?: boolean;
+    maxRecoveries?: number;
   },
 ): Promise<void> {
   const job = await submitJob(command, opts.name, opts.accelerator, {
@@ -133,6 +141,8 @@ export async function clusterSubmitCommand(
     progressPattern: opts.progressPattern,
     ckptGlob: opts.ckptGlob,
     ckptKeep: opts.ckptKeep,
+    allowRecover: opts.allowRecover,
+    maxRecoveries: opts.maxRecoveries,
   });
   console.log(
     `Queued job ${job.id}${job.name ? ` (${job.name})` : ''}${job.accelerator ? ` [${job.accelerator}]` : ''}` +
@@ -147,7 +157,8 @@ function fmtJob(j: Job): string {
   const where = j.endpoint ? `${j.accountId} @ ${j.endpoint} shell=${j.shellId}` : '-';
   const err = j.error ? `  [${j.error}]` : '';
   const prog = j.progress ?? '-';
-  return `${j.id}\t${j.status}\t${prog}\t${j.name ?? ''}\t${where}\t${j.command.slice(0, 60)}${err}`;
+  const rcv = (j.recoveries ?? 0) > 0 ? ` ⟳x${j.recoveries}${j.recoverPending ? '(recovering)' : ''}` : '';
+  return `${j.id}\t${j.status}${rcv}\t${prog}\t${j.name ?? ''}\t${where}\t${j.command.slice(0, 60)}${err}`;
 }
 
 export async function clusterListCommand(): Promise<void> {

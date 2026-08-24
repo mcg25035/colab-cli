@@ -686,7 +686,7 @@ clusterCmd
   .command('submit')
   .description('submit a cluster job (either -c inline command, or -f a job spec JSON with setup_file/uploads/command)')
   .option('-c, --cmd <cmd>', 'shell command to run on the assigned VM (quote it!)')
-  .option('-f, --file <file>', 'job spec JSON: {name?, accelerator?, setup_file?, uploads?, progress_pattern?, ckpt_glob?, ckpt_keep?, command}')
+  .option('-f, --file <file>', 'job spec JSON: {name?, accelerator?, setup_file?, uploads?, progress_pattern?, ckpt_glob?, ckpt_keep?, allow_recover?, max_recoveries?, command}')
   .option('-n, --name <name>', 'job name')
   .option('-a, --accelerator <accelerator>', 'request accelerator for a newly provisioned runtime (CPU, L4, T4, ...)')
   .action(async (opts) => {

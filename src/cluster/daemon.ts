@@ -38,7 +38,8 @@ import { getStoredServer } from '../runtime/storage.js';
  * JSON-lines (same framing as the per-runtime daemon). It owns the job
  * queue: submit → pick idle VM (or provision one) → open a background
  * shell on that VM's per-runtime daemon → run the command → watch status.
- * Recovery from reclaimed runtimes is Phase 4 and explicitly out of scope.
+ * Reclaimed runtimes are auto-recovered (Phase 4): the job is requeued,
+ * lastCkpt re-uploaded, and CLUSTER_RESUME env vars injected for the rerun.
  */
 
 const DISPATCH_INTERVAL_MS = 10_000;
@@ -115,6 +116,45 @@ const FINAL_TAIL_LINES = 2000;
 
 const SETUP_OK_MARK = '__CLUSTER_SETUP_OK__';
 const JOB_OK_MARK = '__CLUSTER_JOB_OK__';
+const DEFAULT_MAX_RECOVERIES = 3;
+
+// ── Phase 4: runtime reclaim recovery ──
+// A reclaimed/lost runtime surfaces as a daemon-connect failure while the
+// job is running. Instead of failing the job outright, requeue it: the
+// dispatcher will pick (or provision) a fresh VM, re-run setup there
+// (vmSetup cache is keyed by endpoint), re-upload lastCkpt and inject
+// CLUSTER_RESUME / CLUSTER_RESUME_CKPT so the user's command can resume.
+// Whether the command actually resumes is application-layer — we only
+// deliver the ckpt and the signal.
+function tryRecoverJob(job: Job, reason: string): void {
+  const rec = job.recoveries ?? 0;
+  const max = job.maxRecoveries ?? DEFAULT_MAX_RECOVERIES;
+  const canRecover = job.allowRecover !== false && rec < max;
+  if (canRecover) {
+    updateJob(job.id, {
+      status: 'queued',
+      accountId: undefined,
+      serverId: undefined,
+      endpoint: undefined,
+      shellId: undefined,
+      recoveries: rec + 1,
+      recoverPending: true,
+      lastRecoveredAt: new Date().toISOString(),
+      error: undefined,
+      progress: undefined,
+    });
+    clog(`job ${job.id} RECOVERY ${rec + 1}/${max}: requeued (${reason})`);
+  } else {
+    const why =
+      job.allowRecover === false ? 'allow_recover=false' : `recovery exhausted (${rec}/${max})`;
+    updateJob(job.id, {
+      status: 'failed',
+      error: `${reason} — ${why} (last mirror in ${jobLogFile(job.id)})`,
+      endedAt: new Date().toISOString(),
+    });
+    clog(`job ${job.id} failed: ${reason} — ${why}`);
+  }
+}
 
 /** Overwrite the job's log mirror with the current shell snapshot. */
 async function mirrorJobLog(job: Job, client: DaemonClient, tailLines: number): Promise<string> {
@@ -196,15 +236,12 @@ async function pollRunningJobs(): Promise<void> {
         client.close();
       }
     } catch (err) {
-      // Daemon unreachable — its runtime is most likely reclaimed. Phase 4
-      // will add re-provisioning from checkpoint; for now, fail clearly but
-      // leave the last mirror standing for diagnosis.
-      updateJob(job.id, {
-        status: 'failed',
-        error: `runtime unreachable: ${err instanceof Error ? err.message : String(err)} (last mirror in ${jobLogFile(job.id)})`,
-        endedAt: new Date().toISOString(),
-      });
-      clog(`job ${job.id} failed: runtime unreachable`);
+      // Daemon unreachable — its runtime was most likely reclaimed (or the
+      // host slept long enough for Colab to reap it). Phase 4: hand off to
+      // recovery — the job is requeued onto a fresh VM with its lastCkpt
+      // unless the user opted out or the budget is exhausted.
+      const reason = `runtime unreachable: ${err instanceof Error ? err.message : String(err)}`;
+      tryRecoverJob(job, reason);
     }
   }
 }
@@ -278,6 +315,25 @@ async function dispatchQueuedJobs(): Promise<void> {
           }
         }
 
+        // 1.5) Phase 4 recovery: re-upload the mirrored ckpt onto the fresh
+        // VM so the re-run can resume. App-layer still owns the resume logic;
+        // we only deliver the file and the CLUSTER_RESUME_* env vars.
+        let resumeCkptRemote = '';
+        if (job.recoverPending) {
+          const local = job.lastCkpt;
+          const entry = job.ckpts?.find((c) => c.localPath === local);
+          if (local && entry && fs.existsSync(local)) {
+            const dest = entry.remotePath;
+            const dir = dest.slice(0, dest.lastIndexOf('/'));
+            await drainExec(client, `import os; os.makedirs(${JSON.stringify(dir)}, exist_ok=True)`);
+            clog(`job ${job.id}: recovery — re-uploading ${path.basename(local)} -> ${dest}`);
+            await clusterUpload(client, target.server, local, dest);
+            resumeCkptRemote = dest;
+          } else {
+            clog(`job ${job.id}: recovery — no usable lastCkpt, resuming without ckpt`);
+          }
+        }
+
         // 2) Write the whole job as a temp script and run it with a fresh
         //    NON-interactive `bash` (which honors `set -e`; the relay's own
         //    bash is interactive because stdin is a TTY, so `set -e` fed to
@@ -288,6 +344,8 @@ async function dispatchQueuedJobs(): Promise<void> {
         const scriptPath = `/tmp/.cluster_job_${job.id}.sh`;
         const script = [
           'set -e',
+          `export CLUSTER_RESUME=${job.recoverPending ? 1 : 0}`,
+          `export CLUSTER_RESUME_CKPT=${resumeCkptRemote ? JSON.stringify(resumeCkptRemote) : "''"}`,
           ...(needsSetup && job.setupScript ? [job.setupScript] : []),
           `echo ${SETUP_OK_MARK}`,
           job.command,
@@ -321,6 +379,11 @@ async function dispatchQueuedJobs(): Promise<void> {
           clog(`job ${job.id} was cancelled mid-dispatch; killing shell ${shellId}`);
           await client.shellClose(shellId).catch(() => {});
           return;
+        }
+        if (job.recoverPending) {
+          // Command has actually started on the fresh VM — the recovery is complete.
+          updateJob(job.id, { recoverPending: false });
+          clog(`job ${job.id}: recovery complete (resume ckpt: ${resumeCkptRemote || 'none'})`);
         }
         clog(`job ${job.id} running on ${target.accountId} ${target.server.endpoint} shell ${shellId}`);
         dispatchAttempts.delete(job.id);
@@ -363,7 +426,8 @@ type Request =
   | { type: 'ping' }
   | { type: 'submit'; command: string; name?: string; accelerator?: string;
       setupScript?: string; uploads?: Array<{ src: string; dest: string }>; rehearse?: boolean;
-      progressPattern?: string; ckptGlob?: string; ckptKeep?: number }
+      progressPattern?: string; ckptGlob?: string; ckptKeep?: number;
+      allowRecover?: boolean; maxRecoveries?: number }
   | { type: 'list' }
   | { type: 'logs'; jobId: number; tail?: number }
   | { type: 'cancel'; jobId: number }
@@ -395,6 +459,9 @@ async function handleRequest(msg: Request): Promise<Response> {
         progressPattern: msg.progressPattern,
         ckptGlob: msg.ckptGlob,
         ckptKeep: msg.ckptKeep,
+        allowRecover: msg.allowRecover,
+        maxRecoveries: msg.maxRecoveries,
+        recoveries: 0,
       });
       clog(`job ${job.id} submitted${job.rehearse ? ' (rehearse)' : ''}: ${msg.command.slice(0, 80)}` +
         `${msg.progressPattern ? ' progress=' + JSON.stringify(msg.progressPattern) : ''}` +
