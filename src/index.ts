@@ -1,5 +1,7 @@
 #!/usr/bin/env -S node --use-env-proxy --disable-warning=UNDICI-EHPA
 
+import './node-guard.js'; // side effect: refuse Node < 22. MUST stay first.
+
 import { Command, Option } from 'commander';
 import fs from 'fs';
 import path from 'path';
