@@ -80,6 +80,10 @@ export interface Job {
   ckptKeep?: number;
   /** Downloaded checkpoints, newest last. */
   ckpts?: JobCkpt[];
+  /** remotePath → last-fetched remote mtimeNs. Includes ckpts that were
+   *  already pruned locally by ckpt_keep — so a pruned file is never
+   *  re-fetched just because it still exists on the VM (thrash guard). */
+  ckptHistory?: Record<string, number>;
   /** Local path of the most recent ckpt (Phase 4 resume input). */
   lastCkpt?: string;
   status: JobStatus;

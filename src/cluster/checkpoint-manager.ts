@@ -95,8 +95,11 @@ export async function scanAndFetchCkpts(
   const remote = await listRemoteCkpts(client, job.ckptGlob);
   if (remote.length === 0) return 0;
 
-  const known = new Map((job.ckpts ?? []).map((c) => [c.remotePath, c]));
-  const fresh = remote.filter((r) => known.get(r.remotePath)?.mtimeNs !== r.mtimeNs);
+  const history: Record<string, number> = { ...(job.ckptHistory ?? {}) };
+  // A file is "fresh" only if we have NEVER fetched this (path, mtime)
+  // pair — pruned local copies stay in history and are never re-fetched
+  // (that was T21's prune/refetch thrash).
+  const fresh = remote.filter((r) => history[r.remotePath] !== r.mtimeNs);
   if (fresh.length === 0) return 0;
 
   fs.mkdirSync(jobCkptDir(job.id), { recursive: true });
@@ -111,8 +114,9 @@ export async function scanAndFetchCkpts(
     const res = await downloadFile(conn, { remotePath: f.remotePath.replace(/^\/+/, ''), localPath }, exec);
     if (res.sizeBytes !== f.sizeBytes) {
       clog(`job ${job.id}: ckpt ${f.remotePath} size mismatch (remote moved mid-download); skipped, will retry next scan`);
-      continue;
+      continue; // NOT recorded in history → retried next scan
     }
+    history[f.remotePath] = f.mtimeNs;
     const entry: JobCkpt = {
       remotePath: f.remotePath,
       localPath,
@@ -125,9 +129,12 @@ export async function scanAndFetchCkpts(
     fetched++;
   }
 
-  // Retention: keep the N newest by fetchedAt; oldest local files roll off.
+  // Retention by REMOTE RECENCY (mtime), not fetch time: "keep the newest N
+  // checkpoints" refers to training recency, not download order. This is
+  // what makes keep=2 hold model_3/model_4 while 1/2 roll off — and stay
+  // off, since history keeps them from coming back.
   const keep = job.ckptKeep && job.ckptKeep > 0 ? job.ckptKeep : 3;
-  ckpts.sort((a, b) => a.fetchedAt.localeCompare(b.fetchedAt));
+  ckpts.sort((a, b) => (a.mtimeNs - b.mtimeNs) || a.fetchedAt.localeCompare(b.fetchedAt));
   while (ckpts.length > keep) {
     const old = ckpts.shift()!;
     try {
@@ -139,8 +146,6 @@ export async function scanAndFetchCkpts(
   }
 
   const last = ckpts[ckpts.length - 1];
-  if (fetched > 0 || ckpts.length !== (job.ckpts ?? []).length) {
-    updateJob(job.id, { ckpts, lastCkpt: last?.localPath });
-  }
+  updateJob(job.id, { ckpts, ckptHistory: history, lastCkpt: last?.localPath });
   return fetched;
 }
