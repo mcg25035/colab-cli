@@ -30,7 +30,7 @@ import { pickIdleVm, snapshotPool } from './pool.js';
 import { clusterUpload } from './upload.js';
 import { extractProgress } from './progress-watcher.js';
 import { scanAndFetchCkpts, shouldScanNow } from './checkpoint-manager.js';
-import { getStoredServer } from '../runtime/storage.js';
+import { getStoredServer, listStoredServers, removeStoredServer } from '../runtime/storage.js';
 
 /**
  * Cluster scheduler daemon: one long-lived local process spanning ALL
@@ -117,6 +117,11 @@ const FINAL_TAIL_LINES = 2000;
 const SETUP_OK_MARK = '__CLUSTER_SETUP_OK__';
 const JOB_OK_MARK = '__CLUSTER_JOB_OK__';
 const DEFAULT_MAX_RECOVERIES = 3;
+
+/** Consecutive daemon-probe failures before a running job's runtime is
+ *  declared dead. Guards recovery from our-side network flaps. */
+const PROBE_FAIL_THRESHOLD = 3;
+const jobProbeFails = new Map<number, number>();
 
 // ── Phase 4: runtime reclaim recovery ──
 // A reclaimed/lost runtime surfaces as a daemon-connect failure while the
@@ -236,13 +241,22 @@ async function pollRunningJobs(): Promise<void> {
         client.close();
       }
     } catch (err) {
-      // Daemon unreachable — its runtime was most likely reclaimed (or the
-      // host slept long enough for Colab to reap it). Phase 4: hand off to
-      // recovery — the job is requeued onto a fresh VM with its lastCkpt
-      // unless the user opted out or the budget is exhausted.
+      // Daemon unreachable — maybe reclaimed, maybe just a transient network
+      // flap on OUR side. Don't act on a single failed tick (a hiccup would
+      // otherwise orphan the still-running VM-side process); require several
+      // consecutive failures before declaring the runtime dead.
+      const fails = (jobProbeFails.get(job.id) ?? 0) + 1;
+      jobProbeFails.set(job.id, fails);
+      if (fails < PROBE_FAIL_THRESHOLD) {
+        clog(`job ${job.id}: daemon probe failed ${fails}/${PROBE_FAIL_THRESHOLD} (${err instanceof Error ? err.message : String(err)}) — retrying next tick`);
+        continue;
+      }
+      jobProbeFails.delete(job.id);
       const reason = `runtime unreachable: ${err instanceof Error ? err.message : String(err)}`;
       tryRecoverJob(job, reason);
+      continue;
     }
+    jobProbeFails.delete(job.id);
   }
 }
 
@@ -550,16 +564,73 @@ function dispatchSoon() {
 }
 
 let ticking = false;
+let sweeping = false;
+let tickCount = 0;
 async function tick() {
   if (ticking) return; // a slow pollRunningJobs must never overlap the next tick
   ticking = true;
   try {
+    tickCount++;
     await pollRunningJobs();
     await dispatchQueuedJobs();
+    if (tickCount % 3 === 0 && !sweeping) {
+      sweeping = true;
+      void sweepIdleVms().finally(() => { sweeping = false; });
+    }
   } catch (err) {
     clog('tick error:', err instanceof Error ? err.message : String(err));
   } finally {
     ticking = false;
+  }
+}
+
+/** Knocks on every idle VM's per-runtime daemon. A VM reclaimed while idle
+ *  otherwise lingers in the pool looking alive until a job trips over it
+ *  (the post-host-sleep zombie case). 2 consecutive failures → forget the
+ *  runtime locally; nothing is destroyed Colab-side, just trust decay. */
+const VM_PROBE_TIMEOUT_MS = 10_000;
+const vmProbeFails = new Map<string, number>();
+async function sweepIdleVms(): Promise<void> {
+  const running = readClusterState().jobs.filter((j) => j.status === 'running');
+  for (const acct of listRegistryAccounts()) {
+    for (const server of listStoredServers(acct.email)) {
+      const key = `${acct.email}:${server.id}`;
+      if (running.some((j) => j.accountId === acct.email && j.endpoint === server.endpoint)) {
+        vmProbeFails.delete(key); // running jobs have their own probe path
+        continue;
+      }
+      let alive = false;
+      try {
+        const client = new DaemonClient();
+        const probe = (async () => {
+          try {
+            await client.connect(acct.email, server.id);
+            await client.shellList();
+            return true;
+          } catch {
+            return false;
+          } finally {
+            client.close();
+          }
+        })();
+        const timeout = new Promise<boolean>((res) =>
+          setTimeout(() => res(false), VM_PROBE_TIMEOUT_MS),
+        );
+        alive = await Promise.race([probe, timeout]);
+        if (!alive) client.close();
+      } catch { alive = false; }
+      if (alive) {
+        if (vmProbeFails.delete(key)) clog(`pool: ${acct.email}/${server.endpoint} healthy again`);
+        continue;
+      }
+      const fails = (vmProbeFails.get(key) ?? 0) + 1;
+      vmProbeFails.set(key, fails);
+      if (fails >= 2) {
+        vmProbeFails.delete(key);
+        removeStoredServer(acct.email, server.id);
+        clog(`pool: pruned dead runtime ${acct.email}/${server.endpoint} (daemon unreachable twice — likely reclaimed)`);
+      }
+    }
   }
 }
 
