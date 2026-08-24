@@ -157,7 +157,7 @@ function fmtJob(j: Job): string {
   const where = j.endpoint ? `${j.accountId} @ ${j.endpoint} shell=${j.shellId}` : '-';
   const err = j.error ? `  [${j.error}]` : '';
   const prog = j.progress ?? '-';
-  const rcv = (j.recoveries ?? 0) > 0 ? ` ⟳x${j.recoveries}${j.recoverPending ? '(recovering)' : ''}` : '';
+  const rcv = (j.recoveries ?? 0) > 0 ? ` retry${j.recoveries}${j.recoverPending ? ' (recovering)' : ''}` : '';
   return `${j.id}\t${j.status}${rcv}\t${prog}\t${j.name ?? ''}\t${where}\t${j.command.slice(0, 60)}${err}`;
 }
 
