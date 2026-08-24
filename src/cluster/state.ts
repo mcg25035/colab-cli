@@ -17,10 +17,28 @@ export const CLUSTER_SOCK = path.join(CLUSTER_DIR, 'cluster.sock');
 export const CLUSTER_PID_FILE = path.join(CLUSTER_DIR, 'cluster.pid');
 export const CLUSTER_LOG_FILE = path.join(CLUSTER_DIR, 'daemon.log');
 export const CLUSTER_LOGS_DIR = path.join(CLUSTER_DIR, 'logs');
+export const CLUSTER_CKPTS_DIR = path.join(CLUSTER_DIR, 'checkpoints');
 
 /** Per-job log mirror file — survives even after the VM is reclaimed. */
 export function jobLogFile(jobId: number): string {
   return path.join(CLUSTER_LOGS_DIR, `job-${jobId}.log`);
+}
+
+/** Local directory holding this job's downloaded checkpoints. */
+export function jobCkptDir(jobId: number): string {
+  return path.join(CLUSTER_CKPTS_DIR, `job-${jobId}`);
+}
+
+/** A checkpoint file mirrored from the VM to local storage. */
+export interface JobCkpt {
+  /** Absolute path on the VM (e.g. /content/ckpts/model_1.pt). */
+  remotePath: string;
+  /** Local mirror path under jobCkptDir. */
+  localPath: string;
+  sizeBytes: number;
+  /** Remote mtime (epoch ns at scan time) — detects in-place rewrites. */
+  mtimeNs: number;
+  fetchedAt: string;
 }
 
 export interface UploadSpec {
@@ -48,6 +66,38 @@ export interface Job {
   rehearse?: boolean;
   /** Local→VM uploads performed before the shell starts. */
   uploads?: UploadSpec[];
+  /** Regex applied (last match) to the mirrored stdout each tick; the
+   *  capture is surfaced as Job.progress. Training scripts don't need to
+   *  change — just point this at whatever they already print. */
+  progressPattern?: string;
+  /** Latest progress line matched by progressPattern (undefined if none yet
+   *  or pattern never matched — never an error in itself). */
+  progress?: string;
+  /** VM-side glob (kernel python glob) scanned periodically; matches are
+   *  chunked-downloaded to jobCkptDir. */
+  ckptGlob?: string;
+  /** Keep at most this many local ckpt copies (oldest pruned). Default 3. */
+  ckptKeep?: number;
+  /** Downloaded checkpoints, newest last. */
+  ckpts?: JobCkpt[];
+  /** remotePath → last-fetched remote mtimeNs. Includes ckpts that were
+   *  already pruned locally by ckpt_keep — so a pruned file is never
+   *  re-fetched just because it still exists on the VM (thrash guard). */
+  ckptHistory?: Record<string, number>;
+  /** Local path of the most recent ckpt (Phase 4 resume input). */
+  lastCkpt?: string;
+  /** Phase 4: false disables auto-recovery from reclaimed/lost runtimes. Default true. */
+  allowRecover?: boolean;
+  /** Phase 4: max auto-recoveries before the job fails for good. Default 3. */
+  maxRecoveries?: number;
+  /** Phase 4: how many times this job has been auto-recovered so far. */
+  recoveries?: number;
+  /** Phase 4: true while a recovered job waits for redispatch; the runner then
+   *  re-uploads lastCkpt and injects CLUSTER_RESUME env vars before re-running
+   *  the command. */
+  recoverPending?: boolean;
+  /** Phase 4: ISO time of the most recent recovery requeue. */
+  lastRecoveredAt?: string;
   status: JobStatus;
   /** Assignment (set once running). */
   accountId?: string;

@@ -22,6 +22,16 @@ interface JobSpecFile {
   /** rehearsal: only run setup + trivial noop, used to validate setup_file
    *  on one VM before deploying it cluster-wide. */
   rehearse?: boolean;
+  /** Optional progress regex; last match in stdout shows in `cluster list`. */
+  progress_pattern?: string;
+  /** Optional VM-side glob for checkpoints to auto-download locally. */
+  ckpt_glob?: string;
+  /** How many local ckpt copies to keep (oldest pruned). Default 3. */
+  ckpt_keep?: number;
+  /** Phase 4: set false to fail instead of auto-recovering a reclaimed VM. */
+  allow_recover?: boolean;
+  /** Phase 4: max auto-recoveries before permanent failure. Default 3. */
+  max_recoveries?: number;
 }
 
 export function loadJobSpec(file: string): JobSpecFile {
@@ -57,6 +67,11 @@ export async function submitFromSpecCommand(specFile: string): Promise<void> {
     setupScript,
     uploads,
     rehearse: spec.rehearse,
+    progressPattern: spec.progress_pattern,
+    ckptGlob: spec.ckpt_glob,
+    ckptKeep: spec.ckpt_keep,
+    allowRecover: spec.allow_recover,
+    maxRecoveries: spec.max_recoveries,
   });
 }
 
@@ -112,16 +127,27 @@ export async function clusterSubmitCommand(
     setupScript?: string;
     uploads?: Array<{ src: string; dest: string }>;
     rehearse?: boolean;
+    progressPattern?: string;
+    ckptGlob?: string;
+    ckptKeep?: number;
+    allowRecover?: boolean;
+    maxRecoveries?: number;
   },
 ): Promise<void> {
   const job = await submitJob(command, opts.name, opts.accelerator, {
     setupScript: opts.setupScript,
     uploads: opts.uploads,
     rehearse: opts.rehearse,
+    progressPattern: opts.progressPattern,
+    ckptGlob: opts.ckptGlob,
+    ckptKeep: opts.ckptKeep,
+    allowRecover: opts.allowRecover,
+    maxRecoveries: opts.maxRecoveries,
   });
   console.log(
     `Queued job ${job.id}${job.name ? ` (${job.name})` : ''}${job.accelerator ? ` [${job.accelerator}]` : ''}` +
-      `${opts.setupScript ? ' +setup' : ''}${opts.uploads?.length ? ` +${opts.uploads.length} upload(s)` : ''}${opts.rehearse ? ' REHEARSE' : ''}`,
+      `${opts.setupScript ? ' +setup' : ''}${opts.uploads?.length ? ` +${opts.uploads.length} upload(s)` : ''}${opts.rehearse ? ' REHEARSE' : ''}` +
+      `${opts.progressPattern ? ' +progress' : ''}${opts.ckptGlob ? ' +ckpt-sync' : ''}`,
   );
   console.log('Watch: colab cluster list / colab cluster logs ' + job.id);
   console.log(`Log file (survives VM loss): ~/.config/colab-cli/cluster/logs/job-${job.id}.log`);
@@ -130,7 +156,9 @@ export async function clusterSubmitCommand(
 function fmtJob(j: Job): string {
   const where = j.endpoint ? `${j.accountId} @ ${j.endpoint} shell=${j.shellId}` : '-';
   const err = j.error ? `  [${j.error}]` : '';
-  return `${j.id}\t${j.status}\t${j.name ?? ''}\t${where}\t${j.command.slice(0, 60)}${err}`;
+  const prog = j.progress ?? '-';
+  const rcv = (j.recoveries ?? 0) > 0 ? ` retry${j.recoveries}${j.recoverPending ? ' (recovering)' : ''}` : '';
+  return `${j.id}\t${j.status}${rcv}\t${prog}\t${j.name ?? ''}\t${where}\t${j.command.slice(0, 60)}${err}`;
 }
 
 export async function clusterListCommand(): Promise<void> {
@@ -139,8 +167,29 @@ export async function clusterListCommand(): Promise<void> {
     console.log('No jobs.');
     return;
   }
-  console.log('ID\tSTATUS\tNAME\tASSIGNMENT\tCOMMAND');
+  console.log('ID\tSTATUS\tPROGRESS\tNAME\tASSIGNMENT\tCOMMAND');
   for (const j of jobs) console.log(fmtJob(j));
+}
+
+/** List a job's mirrored checkpoints (local copies that survive VM loss). */
+export async function clusterCkptsCommand(jobId: number): Promise<void> {
+  const jobs = await listClusterJobs();
+  const job = jobs.find((j) => j.id === jobId);
+  if (!job) {
+    console.error(`job ${jobId} not found`);
+    process.exit(1);
+  }
+  const ckpts = job.ckpts ?? [];
+  if (ckpts.length === 0) {
+    console.log(`job ${jobId}: no checkpoints mirrored${job.ckptGlob ? ` (glob: ${job.ckptGlob})` : ''}`);
+    return;
+  }
+  console.log(`job ${jobId} checkpoints (keep=${job.ckptKeep ?? 3}, glob=${job.ckptGlob ?? '-'}):`);
+  for (const c of ckpts) {
+    const exists = fs.existsSync(c.localPath) ? '' : '  [MISSING on disk]';
+    console.log(`  ${c.localPath}  ${c.sizeBytes} B  fetched ${c.fetchedAt}  <- ${c.remotePath}${exists}`);
+  }
+  if (job.lastCkpt) console.log(`lastCkpt: ${job.lastCkpt}`);
 }
 
 export async function clusterLogsCommand(jobId: number, tail?: number): Promise<void> {
