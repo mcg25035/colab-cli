@@ -68,16 +68,30 @@ export async function snapshotPool(runningJobs: Job[]): Promise<Pool> {
  * Pick an idle VM for a queued job: daemon alive, and no running cluster job
  * assigned to it (one job per VM — training workloads assume uncontended
  * machines; revisit if we ever want bin-packing).
+ *
+ * With `accelerator`, only consider VMs whose label carries that hardware
+ * (a T4 job must not land on a CPU VM). Without one, prefer non-GPU VMs so
+ * plain jobs don't park on expensive accelerators, but fall back to anything.
  */
 export async function pickIdleVm(
   pool: Pool,
+  accelerator?: string,
 ): Promise<{ accountId: string; server: StoredServer } | undefined> {
+  const want = accelerator?.trim().toUpperCase().replace(/[-\s]/g, '');
+  let fallback: { accountId: string; server: StoredServer } | undefined;
   for (const acct of pool.accounts) {
     for (const vm of acct.vms) {
       if (!vm.daemonAlive) continue;
       if (vm.jobIds.length > 0) continue;
-      return { accountId: acct.accountId, server: vm.server };
+      const hw = vm.server.label.toUpperCase();
+      if (want && want !== 'CPU') {
+        if (hw.includes(want)) return { accountId: acct.accountId, server: vm.server };
+        continue;
+      }
+      // unaccelerated job: prefer CPU/default VMs, remember GPU ones as fallback
+      if (!/GPU|TPU/.test(hw)) return { accountId: acct.accountId, server: vm.server };
+      fallback ??= { accountId: acct.accountId, server: vm.server };
     }
   }
-  return undefined;
+  return fallback;
 }
