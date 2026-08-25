@@ -197,6 +197,10 @@ async function spawnAndWait(accountId: string, serverId: UUID): Promise<void> {
     // Bug #1: older Node rejects --use-env-proxy. Proxying still works via
     // HTTP(S)_PROXY env vars, so just drop the flag instead of failing.
     argv.shift();
+    log.warn(
+      `'--use-env-proxy' not supported by ${process.version} (needs Node >= 22); ` +
+        `spawning daemon without it — control-plane proxying disabled. Remove the flag or upgrade Node.`,
+    );
   }
   const child = spawn(
     process.execPath,
