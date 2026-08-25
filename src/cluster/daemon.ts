@@ -57,6 +57,20 @@ const badVmUntil = new Map<string, number>();
 const BAD_VM_MS = 5 * 60_000;
 const vmKey = (accountId: string, endpoint: string) => `${accountId}:${endpoint}`;
 
+/**
+ * Map a job-spec accelerator string to a Colab variant + accelerator name.
+ * Mirrors parseAcceleratorSelection() in commands/runtime.ts, but returns
+ * errors instead of process.exit (daemon must not die on a bad job spec).
+ */
+function acceleratorToVariant(accel?: string): { variant: Variant; accelerator?: string } {
+  if (!accel) return { variant: Variant.DEFAULT };
+  const n = accel.trim().toUpperCase().replace(/\s+(GPU|TPU)$/, '').replace(/[-\s]/g, '');
+  if (n === 'CPU') return { variant: Variant.DEFAULT };
+  if (['H100', 'G4', 'A100', 'L4', 'T4'].includes(n)) return { variant: Variant.GPU, accelerator: n };
+  if (n === 'V6E1' || n === 'V5E1') return { variant: Variant.TPU, accelerator: n };
+  throw new Error(`unknown accelerator: ${accel}`);
+}
+
 if (process.env.COLAB_CLUSTER_DAEMON !== '1') {
   console.error('cluster daemon must be spawned by the CLI (sets COLAB_CLUSTER_DAEMON=1)');
   process.exit(1);
@@ -222,19 +236,38 @@ async function pollRunningJobs(): Promise<void> {
           // One last forced ckpt pull so a late-written checkpoint isn't
           // stranded on a runtime that's about to be released.
           await observeJob(job, client, tail, true);
-          if (job.endpoint && tail.includes(SETUP_OK_MARK)) {
+          // Ground truth for pass/fail is the rc file the runner writes —
+          // markers in scrollback can be lost to tail truncation or bypassed
+          // by an explicit `exit` in the user command (issue #9).
+          let rc: number | undefined;
+          try {
+            const out = await drainExec(
+              client,
+              `import os; p=${JSON.stringify(`/tmp/.cluster_job_${job.id}.rc`)}; print(open(p).read().strip() if os.path.exists(p) else '')`,
+            );
+            const parsed = parseInt(out.trim().split('\n').pop() ?? '', 10);
+            if (Number.isFinite(parsed)) rc = parsed;
+          } catch { /* VM may already be unhealthy; fall back to markers */ }
+          if (rc === 0 && job.endpoint) {
+            markVmSetup(job.endpoint, job.accountId!, setupHash(job.setupScript ?? ''));
+          } else if (job.endpoint && tail.includes(SETUP_OK_MARK)) {
+            // runner may be older (pre-rc fix) — keep the marker path working
             markVmSetup(job.endpoint, job.accountId!, setupHash(job.setupScript ?? ''));
           }
-          const jobOk = tail.includes(JOB_OK_MARK);
+          const jobOk = rc === 0 || tail.includes(JOB_OK_MARK);
           const rehearsal = tail.includes(SETUP_OK_MARK);
-          const succeeded = jobOk || (job.rehearse && rehearsal) || (!job.setupScript && !job.rehearse && tail.includes(JOB_OK_MARK));
+          const succeeded = jobOk || (job.rehearse && rehearsal);
+          const errMsg =
+            rc !== undefined
+              ? rehearsal
+                ? `command exited with code ${rc} (see log)`
+                : `setup script failed with code ${rc} (see log)`
+              : !job.setupScript || tail.includes(SETUP_OK_MARK)
+                ? 'command exited without the completion marker (see log)'
+                : 'setup script failed (see log)';
           updateJob(job.id, {
             status: succeeded ? 'done' : 'failed',
-            error: succeeded
-              ? undefined
-              : tail.includes(SETUP_OK_MARK) || !job.setupScript
-                ? 'command exited without the completion marker (see log)'
-                : 'setup script failed (see log)',
+            error: succeeded ? undefined : errMsg,
             lastOutput: tail.slice(-4000),
             endedAt: new Date().toISOString(),
           });
@@ -275,21 +308,15 @@ async function dispatchQueuedJobs(): Promise<void> {
   const pool = await snapshotPool(running);
 
   for (const job of queued) {
-    let target = await pickIdleVm(pool);
-    // Fence recently-dead VMs out of this tick's pick.
+    // Fence recently-dead VMs out of this tick's picks, then pick matching hardware.
     const now0 = Date.now();
-    if (target && (badVmUntil.get(vmKey(target.accountId, target.server.endpoint)) ?? 0) > now0) {
-      target = undefined;
-      for (const acct of pool.accounts) {
-        for (const vm of acct.vms) {
-          if (!vm.daemonAlive || vm.jobIds.length > 0) continue;
-          if ((badVmUntil.get(vmKey(acct.accountId, vm.server.endpoint)) ?? 0) > now0) continue;
-          target = { accountId: acct.accountId, server: vm.server };
-          break;
-        }
-        if (target) break;
-      }
-    }
+    const poolView: typeof pool = {
+      accounts: pool.accounts.map((a) => ({
+        ...a,
+        vms: a.vms.filter((vm) => (badVmUntil.get(vmKey(a.accountId, vm.server.endpoint)) ?? 0) <= now0),
+      })),
+    };
+    let target = await pickIdleVm(poolView, job.accelerator);
     if (!target) {
       // No idle VM in the whole pool — provision one. Rotate the starting
       // account each tick (a stable sort would otherwise retry the same
@@ -311,12 +338,12 @@ async function dispatchQueuedJobs(): Promise<void> {
       for (const acct of accounts.slice(0, MAX_PROVISION_ATTEMPTS_PER_TICK + 1)) {
         try {
           clog(`job ${job.id}: no idle VM; provisioning runtime on ${acct.email}`);
+          const sel = acceleratorToVariant(job.accelerator);
           const server = await (await managerFor(acct.email)).create({
-            variant: Variant.DEFAULT,
-            // undefined accelerator = resolveAccelerator picks CPU
-            accelerator: job.accelerator,
+            variant: sel.variant,
+            accelerator: sel.accelerator,
           });
-          clog(`job ${job.id}: provisioned ${server.endpoint} on ${acct.email}`);
+          clog(`job ${job.id}: provisioned ${server.endpoint} (${server.label}) on ${acct.email}`);
           target = { accountId: acct.email, server };
           provisioned = true;
           break;
@@ -376,6 +403,8 @@ async function dispatchQueuedJobs(): Promise<void> {
         const needsSetup =
           !!job.setupScript && getVmSetup(target.server.endpoint)?.hash !== setupHash(job.setupScript);
         const scriptPath = `/tmp/.cluster_job_${job.id}.sh`;
+        const runnerPath = `/tmp/.cluster_run_${job.id}.sh`;
+        const rcPath = `/tmp/.cluster_job_${job.id}.rc`;
         const script = [
           'set -e',
           `export CLUSTER_RESUME=${job.recoverPending ? 1 : 0}`,
@@ -392,10 +421,25 @@ async function dispatchQueuedJobs(): Promise<void> {
         // heredoc-feeding on the PTY would echo the marker lines into the
         // scrollback, making the poller see "__MARK__" even when the script
         // never ran them.
+        //
+        // The RUNNER wrapper (also base64-written, never echoed) records the
+        // real exit status: a user command ending in `exit 0` would otherwise
+        // kill the script before JOB_OK is echoed and the job would be
+        // misclassified as failed (issue #9). rc is ground truth; markers are
+        // just the fast human-readable path.
         const b64 = Buffer.from(script.join('\n') + '\n', 'utf8').toString('base64');
         await drainExec(client, `import base64; open(${JSON.stringify(scriptPath)},'w').write(base64.b64decode(${JSON.stringify(b64)}).decode())`);
+        const runner = [
+          `bash ${scriptPath}`,
+          'rc=$?',
+          `echo $rc > ${rcPath}`,
+          `if [ "$rc" -eq 0 ]; then echo ${JOB_OK_MARK}; fi`,
+          'exit',
+        ].join('\n');
+        const rb64 = Buffer.from(runner + '\n', 'utf8').toString('base64');
+        await drainExec(client, `import base64; open(${JSON.stringify(runnerPath)},'w').write(base64.b64decode(${JSON.stringify(rb64)}).decode())`);
         const shellId = await client.shellOpen(120, 30);
-        client.shellInput(shellId, `bash ${scriptPath}\nexit\n`);
+        client.shellInput(shellId, `bash ${runnerPath}\nexit\n`);
         // Race guard (T8): the user may have cancelled while we were
         // uploading/deploying. State refuses the running resurrection via
         // updateJob's terminal-state guard; here we detect that refusal and
