@@ -4,15 +4,25 @@ import type { UUID } from 'crypto';
 import { CONFIG_DIR } from '../config.js';
 
 /**
- * Cluster state persistence. A single JSON file, written atomically
- * (write-temp + rename). Only jobs and the id counter are persisted —
- * pool state (accounts/VMs) is derived live from the registry + per-account
- * daemon liveness, since Colab runtimes are ephemeral by nature and stale
- * pool entries would be worse than no entries.
+ * Cluster state persistence.
+ *
+ * Layout (per-job-file scheme, atomic write-temp+rename everywhere):
+ *   cluster/state.json    — tiny global doc: { nextJobId, vmSetup }
+ *   cluster/jobs/<id>.json — one file per job. Each file has exactly ONE
+ *                            writer at a time inside the daemon (an in-process
+ *                            per-job write queue), so concurrent workers
+ *                            (poller / ckpt downloader / dispatcher) can never
+ *                            clobber each other's whole-file writes.
+ *   cluster/logs/job-<id>.log        — log mirrors
+ *   cluster/checkpoints/job-<id>/    — mirrored checkpoints
+ *
+ * An old monolithic state.json (with an embedded jobs array) is migrated
+ * once at first access: jobs split out, original kept as state.json.bak.
  */
 
 export const CLUSTER_DIR = path.join(CONFIG_DIR, 'cluster');
 export const CLUSTER_STATE_FILE = path.join(CLUSTER_DIR, 'state.json');
+export const CLUSTER_JOBS_DIR = path.join(CLUSTER_DIR, 'jobs');
 export const CLUSTER_SOCK = path.join(CLUSTER_DIR, 'cluster.sock');
 export const CLUSTER_PID_FILE = path.join(CLUSTER_DIR, 'cluster.pid');
 export const CLUSTER_LOG_FILE = path.join(CLUSTER_DIR, 'daemon.log');
@@ -127,39 +137,80 @@ interface ClusterState {
   vmSetup: Record<string, VmSetupRecord>;
 }
 
-const EMPTY: ClusterState = { nextJobId: 1, jobs: [], vmSetup: {} };
+/** Global doc shape on disk (jobs no longer live here). */
+interface GlobalState {
+  nextJobId: number;
+  vmSetup: Record<string, VmSetupRecord>;
+}
 
-export function readClusterState(): ClusterState {
+let migrated = false;
+function ensureMigrated(): void {
+  if (migrated) return;
+  migrated = true;
+  let raw: { nextJobId?: number; jobs?: unknown; vmSetup?: unknown };
+  try {
+    raw = JSON.parse(fs.readFileSync(CLUSTER_STATE_FILE, 'utf8'));
+  } catch {
+    return; // fresh install — nothing to migrate
+  }
+  if (!Array.isArray(raw.jobs) || raw.jobs.length === 0) return;
+  fs.mkdirSync(CLUSTER_JOBS_DIR, { recursive: true });
+  fs.copyFileSync(CLUSTER_STATE_FILE, `${CLUSTER_STATE_FILE}.bak`);
+  for (const j of raw.jobs as Job[]) {
+    writeJobFile(j);
+  }
+  writeGlobal({ nextJobId: raw.nextJobId ?? 1, vmSetup: (raw.vmSetup as GlobalState['vmSetup']) ?? {} });
+}
+
+function writeGlobal(g: GlobalState): void {
+  fs.mkdirSync(CLUSTER_DIR, { recursive: true });
+  const tmp = `${CLUSTER_STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(g, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, CLUSTER_STATE_FILE);
+}
+
+function readGlobal(): GlobalState {
+  ensureMigrated();
   try {
     const raw = JSON.parse(fs.readFileSync(CLUSTER_STATE_FILE, 'utf8'));
     return {
       nextJobId: typeof raw.nextJobId === 'number' ? raw.nextJobId : 1,
-      jobs: Array.isArray(raw.jobs) ? raw.jobs : [],
       vmSetup: raw.vmSetup && typeof raw.vmSetup === 'object' ? raw.vmSetup : {},
     };
   } catch {
-    return { ...EMPTY, vmSetup: {} };
+    return { nextJobId: 1, vmSetup: {} };
   }
 }
 
-export function writeClusterState(state: ClusterState): void {
-  fs.mkdirSync(CLUSTER_DIR, { recursive: true });
-  const tmp = `${CLUSTER_STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, CLUSTER_STATE_FILE);
+function jobFile(id: number): string {
+  return path.join(CLUSTER_JOBS_DIR, `${id}.json`);
+}
+
+function writeJobFile(job: Job): void {
+  fs.mkdirSync(CLUSTER_JOBS_DIR, { recursive: true });
+  const tmp = `${jobFile(job.id)}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, jobFile(job.id));
+}
+
+function readJobFile(id: number): Job | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(jobFile(id), 'utf8'));
+  } catch {
+    return undefined;
+  }
 }
 
 export function addJob(j: Omit<Job, 'id' | 'createdAt' | 'status'>): Job {
-  const st = readClusterState();
-  const job: Job = { ...j, id: st.nextJobId++, status: 'queued', createdAt: new Date().toISOString() };
-  st.jobs.push(job);
-  writeClusterState(st);
+  const g = readGlobal();
+  const job: Job = { ...j, id: g.nextJobId++, status: 'queued', createdAt: new Date().toISOString() };
+  writeGlobal(g);
+  writeJobFile(job);
   return job;
 }
 
 export function updateJob(id: number, patch: Partial<Job>): Job | undefined {
-  const st = readClusterState();
-  const job = st.jobs.find((x) => x.id === id);
+  const job = readJobFile(id);
   if (!job) return undefined;
   // Terminal states are final: a stale dispatcher snapshot (taken before a
   // cancel/failure landed) must never resurrect the job. T8 race fix.
@@ -172,16 +223,31 @@ export function updateJob(id: number, patch: Partial<Job>): Job | undefined {
     return job; // refuse the resurrection; ignore patch
   }
   Object.assign(job, patch);
-  writeClusterState(st);
+  writeJobFile(job);
   return job;
 }
 
 export function getJob(id: number): Job | undefined {
-  return readClusterState().jobs.find((x) => x.id === id);
+  ensureMigrated();
+  return readJobFile(id);
 }
 
 export function listJobs(): Job[] {
-  return readClusterState().jobs;
+  ensureMigrated();
+  let files: string[];
+  try {
+    files = fs.readdirSync(CLUSTER_JOBS_DIR);
+  } catch {
+    return [];
+  }
+  const jobs: Job[] = [];
+  for (const f of files) {
+    const m = /^(\d+)\.json$/.exec(f);
+    if (!m) continue;
+    const j = readJobFile(Number(m[1]));
+    if (j) jobs.push(j);
+  }
+  return jobs.sort((a, b) => a.id - b.id);
 }
 
 /** Hash used to decide whether a VM must re-run a job's setup script. */
@@ -192,11 +258,11 @@ export function setupHash(script: string): string {
 }
 
 export function markVmSetup(endpoint: string, accountId: string, hash: string): void {
-  const st = readClusterState();
-  st.vmSetup[endpoint] = { hash, accountId, doneAt: new Date().toISOString() };
-  writeClusterState(st);
+  const g = readGlobal();
+  g.vmSetup[endpoint] = { hash, accountId, doneAt: new Date().toISOString() };
+  writeGlobal(g);
 }
 
 export function getVmSetup(endpoint: string): VmSetupRecord | undefined {
-  return readClusterState().vmSetup[endpoint];
+  return readGlobal().vmSetup[endpoint];
 }

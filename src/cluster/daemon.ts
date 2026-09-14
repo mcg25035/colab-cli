@@ -20,10 +20,8 @@ import {
   jobLogFile,
   listJobs,
   markVmSetup,
-  readClusterState,
   setupHash,
   updateJob,
-  writeClusterState,
   type Job,
 } from './state.js';
 import { pickIdleVm, snapshotPool } from './pool.js';
@@ -42,7 +40,8 @@ import { getStoredServer, listStoredServers, removeStoredServer } from '../runti
  * lastCkpt re-uploaded, and CLUSTER_RESUME env vars injected for the rerun.
  */
 
-const DISPATCH_INTERVAL_MS = 10_000;
+const DISPATCH_INTERVAL_MS = Number(process.env.COLAB_CLUSTER_DISPATCH_MS) || 10_000; // env override: chaos tests only
+const DISPATCH_SOON_MS = Number(process.env.COLAB_CLUSTER_DISPATCH_SOON_MS) || 500; // env override: chaos tests only
 const MAX_PROVISION_ATTEMPTS_PER_TICK = 1;
 /** Accounts whose auth failed recently — skip until this epoch-ms. */
 const authDeadUntil = new Map<string, number>();
@@ -91,6 +90,18 @@ async function managerFor(accountId: string): Promise<RuntimeManager> {
   let pending = managerReady.get(accountId);
   if (!pending) {
     pending = (async () => {
+      // Chaos-test injection point (ONLY divergence allowed here): when
+      // COLAB_CHAOS_TEST=1, the RuntimeManager comes from test/chaos, which
+      // also spins up in-process mock per-runtime daemon sockets + mock
+      // Jupyter contents endpoints. Production never sets this env.
+      if (process.env.COLAB_CHAOS_TEST === '1') {
+        const mod = await import(
+          new URL('../../test/chaos/hooks.js', import.meta.url).href
+        );
+        const m = mod.makeMockRuntimeManager(accountId) as unknown as RuntimeManager;
+        managers.set(accountId, m);
+        return m;
+      }
       const authManager = new AuthManager(accountId);
       await authManager.initialize(); // without this, getAccessToken reports "not logged in"
       const colabClient = new ColabClient(
@@ -220,7 +231,7 @@ async function observeJob(job: Job, client: DaemonClient, logTail: string, force
 }
 
 async function pollRunningJobs(): Promise<void> {
-  for (const job of readClusterState().jobs.filter((j) => j.status === 'running')) {
+  for (const job of listJobs().filter((j) => j.status === 'running')) {
     try {
       const client = await daemonClientFor(job);
       try {
@@ -300,11 +311,11 @@ async function pollRunningJobs(): Promise<void> {
 }
 
 async function dispatchQueuedJobs(): Promise<void> {
-  const state = readClusterState();
-  const queued = state.jobs.filter((j) => j.status === 'queued');
+  const jobs = listJobs();
+  const queued = jobs.filter((j) => j.status === 'queued');
   if (queued.length === 0) return;
 
-  const running = state.jobs.filter((j) => j.status === 'running' || j.status === 'provisioning');
+  const running = jobs.filter((j) => j.status === 'running' || j.status === 'provisioning');
   const pool = await snapshotPool(running);
 
   for (const job of queued) {
@@ -322,7 +333,7 @@ async function dispatchQueuedJobs(): Promise<void> {
       // account each tick (a stable sort would otherwise retry the same
       // first accounts forever) and skip accounts whose login recently
       // failed (their tokens are dead until re-auth).
-      if (running.length === 0 && state.jobs.some((j) => j.status === 'provisioning')) return;
+      if (running.length === 0 && jobs.some((j) => j.status === 'provisioning')) return;
       const now = Date.now();
       const healthy = listRegistryAccounts().filter((a) => (authDeadUntil.get(a.email) ?? 0) < now);
       const sorted = healthy.sort(
@@ -625,7 +636,7 @@ function dispatchSoon() {
   dispatchTimer = setTimeout(() => {
     dispatchTimer = undefined;
     void tick();
-  }, 500);
+  }, DISPATCH_SOON_MS);
 }
 
 let ticking = false;
@@ -656,7 +667,7 @@ async function tick() {
 const VM_PROBE_TIMEOUT_MS = 10_000;
 const vmProbeFails = new Map<string, number>();
 async function sweepIdleVms(): Promise<void> {
-  const running = readClusterState().jobs.filter((j) => j.status === 'running');
+  const running = listJobs().filter((j) => j.status === 'running');
   for (const acct of listRegistryAccounts()) {
     for (const server of listStoredServers(acct.email)) {
       const key = `${acct.email}:${server.id}`;
