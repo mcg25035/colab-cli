@@ -1,7 +1,7 @@
 import readline from 'readline';
 import open from 'open';
 import { AuthType } from '../colab/api.js';
-import { ColabClient } from '../colab/client.js';
+import { ColabClient, ColabRequestError } from '../colab/client.js';
 import { log } from '../logging/index.js';
 import { isJsonMode, notifyAuthUrl } from '../output/json-output.js';
 
@@ -38,15 +38,15 @@ export async function handleEphemeralAuth(
   if (dryRunResult.success) {
     await propagateCredentials(apiClient, endpoint, authType);
   } else if (dryRunResult.unauthorizedRedirectUri) {
-    const consent = await promptUserConsent(
+    await promptUserConsent(
+      apiClient,
+      endpoint,
       authType,
       dryRunResult.unauthorizedRedirectUri,
       serverLabel,
     );
-    if (!consent) {
-      throw new Error(`User cancelled ${authType} authorization`);
-    }
-    await propagateCredentials(apiClient, endpoint, authType);
+    // waitForConsent() returns only after a successful non-dry-run
+    // propagation, so there is nothing left to do here.
   } else {
     throw new Error(
       `[${authType}] Credentials propagation dry run returned unexpected results: ${JSON.stringify(dryRunResult)}`,
@@ -55,10 +55,12 @@ export async function handleEphemeralAuth(
 }
 
 async function promptUserConsent(
+  apiClient: ColabClient,
+  endpoint: string,
   authType: AuthType,
   unauthorizedRedirectUri: string,
   serverLabel?: string,
-): Promise<boolean> {
+): Promise<void> {
   let message: string;
   let detail: string;
   const label = serverLabel ?? 'this runtime';
@@ -83,8 +85,8 @@ async function promptUserConsent(
   // Phase 1 post-test (Bug #6): the y/n consent prompt is skipped entirely —
   // consent is treated as granted (auto-y). This keeps `drive-mount` (and any
   // other ephemeral-auth consumer) usable from scripts/agents that run with a
-  // non-interactive stdin: the only required interaction is the URL + a final
-  // Enter to confirm the authorization finished in the browser.
+  // non-interactive stdin: the only required interaction is the browser
+  // consent itself, which waitForConsent() detects by polling.
   notifyAuthUrl(`${authType} authorization for ${label}`, unauthorizedRedirectUri);
   try {
     await open(unauthorizedRedirectUri);
@@ -96,8 +98,93 @@ async function promptUserConsent(
     throw new AuthConsentError(authType, unauthorizedRedirectUri);
   }
 
-  await askQuestion('Press Enter after authorization is complete...');
-  return true;
+  await waitForConsent(apiClient, endpoint, authType);
+}
+
+const CONSENT_POLL_INTERVAL_MS = 3_000;
+const CONSENT_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Wait until the user finishes the browser consent.
+ *
+ * Resolves only after a successful non-dry-run propagation.
+ *
+ * Previously this relied solely on "Press Enter", which was invisible in
+ * practice: `drive-mount`'s ora spinner redrew over the prompt line, so the
+ * user consented in the browser and then watched a spinner forever while the
+ * CLI waited for an Enter they never knew to press. Now we poll the dry-run
+ * endpoint in the background and continue automatically once the backend
+ * reports the credentials were propagated. Enter still works as a manual
+ * "check now"; pressing it too early just keeps waiting instead of failing.
+ */
+async function waitForConsent(
+  apiClient: ColabClient,
+  endpoint: string,
+  authType: AuthType,
+): Promise<void> {
+  const deadline = Date.now() + CONSENT_TIMEOUT_MS;
+  const out = isJsonMode() ? process.stderr : process.stdout;
+  const canPrompt = Boolean(process.stdin.isTTY);
+  let rl: readline.Interface | undefined;
+  let enterPressed: (() => void) | undefined;
+
+  if (canPrompt) {
+    rl = readline.createInterface({ input: process.stdin, output: out });
+    rl.on('line', () => enterPressed?.());
+    out.write('Waiting for browser authorization (auto-detected; press Enter to re-check now)...\n');
+  } else {
+    out.write('Waiting for browser authorization (auto-detected)...\n');
+  }
+
+  // Poll with dryRun=FALSE. Verified live (2026-11-23): after the user
+  // consents, dryRun=true keeps returning success:false until a real
+  // (dryRun=false) propagation has been made — so polling the dry run alone
+  // never completes. This matches the daemon's background-exec polling in
+  // src/daemon/server.ts (tryPropagateCredentialsForPolling).
+  const isAuthorized = async (): Promise<boolean> => {
+    try {
+      const r = await apiClient.propagateCredentials(endpoint, { authType, dryRun: false });
+      log.trace(`[${authType}] consent poll:`, r);
+      return r.success;
+    } catch (err) {
+      if (err instanceof ColabRequestError && err.status >= 400 && err.status < 500) {
+        log.debug(`[${authType}] consent poll: not ready (${err.status})`);
+        return false;
+      }
+      throw err;
+    }
+  };
+
+  try {
+    while (true) {
+      if (await isAuthorized()) {
+        out.write('Authorization detected.\n');
+        return;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `[${authType}] Timed out after ${CONSENT_TIMEOUT_MS / 60_000} minutes waiting for browser authorization`,
+        );
+      }
+      const woke = await new Promise<'tick' | 'enter'>((resolve) => {
+        const t = setTimeout(() => resolve('tick'), Math.min(CONSENT_POLL_INTERVAL_MS, remaining));
+        enterPressed = () => {
+          clearTimeout(t);
+          resolve('enter');
+        };
+      });
+      enterPressed = undefined;
+      if (woke === 'enter' && !(await isAuthorized())) {
+        out.write(
+          'Backend does not report the authorization yet. Finish the consent in the browser ' +
+            '(make sure the Google Drive permission checkbox is ticked); still waiting...\n',
+        );
+      }
+    }
+  } finally {
+    rl?.close();
+  }
 }
 
 async function propagateCredentials(
@@ -113,17 +200,4 @@ async function propagateCredentials(
   if (!result.success) {
     throw new Error(`[${authType}] Credentials propagation unsuccessful`);
   }
-}
-
-function askQuestion(prompt: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: isJsonMode() ? process.stderr : process.stdout,
-  });
-  return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
 }

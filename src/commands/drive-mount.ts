@@ -57,7 +57,11 @@ export async function driveMountCommand(
   const client = new DaemonClient();
   try {
     await client.connect(server.accountId!, server.id);
-    spinner.text = 'Mounting Google Drive via ephemeral auth flow...';
+    // Stop (not just re-label) the spinner: a live ora spinner redraws over
+    // the auth URL / prompt lines that handleEphemeralAuth prints, which made
+    // the flow look hung after the user consented in the browser.
+    spinner.stop();
+    console.error('Mounting Google Drive via ephemeral auth flow...');
   } catch (err) {
     spinner.fail('Failed to connect to daemon');
     throw err;
@@ -91,10 +95,10 @@ export async function driveMountCommand(
   }
 
   if (hasError) {
-    spinner.fail('Drive mount failed');
+    createSpinner('').fail('Drive mount failed');
     process.exitCode = 1;
     return;
   }
 
-  spinner.succeed(`Google Drive mounted at ${MOUNT_PATH}`);
+  createSpinner('').succeed(`Google Drive mounted at ${MOUNT_PATH}`);
 }
